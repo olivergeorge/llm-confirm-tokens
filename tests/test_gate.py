@@ -149,11 +149,13 @@ def test_count_prompt_tokens_handles_inline_byte_attachment():
     assert count_prompt_tokens(prompt) > count_prompt_tokens(_FakePrompt("hi"))
 
 
-def test_count_prompt_tokens_image_attachment_uses_fixed_per_image_cost():
-    """Image attachments cost a fixed per-image estimate, not a bytes heuristic.
+def test_count_prompt_tokens_image_attachment_falls_back_without_dimensions():
+    """Image bytes we can't parse for dimensions fall back to the flat cost.
 
-    Gemini charges ~258 tokens per image regardless of resolution, so a large
-    JPEG should not inflate the estimate as if it were bytes of text.
+    A fake JPEG with no Start-Of-Frame marker is unparseable, so the heuristic
+    can't apply a per-provider tile formula and uses the ``_IMAGE_TOKENS``
+    baseline (258). The key invariant is that we don't fall through to the
+    bytes-as-text path (~25 000 tokens) for 100 KB of opaque bytes.
     """
 
     class _FakeImage:
@@ -167,9 +169,157 @@ def test_count_prompt_tokens_image_attachment_uses_fixed_per_image_cost():
     prompt = _FakePrompt("hi", attachments=[_FakeImage(big_image)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # The image must cost around one image's worth of tokens (~250), not
-    # ~25000 that a naive bytes//4 would produce.
     assert 150 < (n - bare) < 400
+
+
+def _png_with_dims(width: int, height: int) -> bytes:
+    """Return the smallest byte string that parses as PNG with given dims."""
+    import struct
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + b"\x00\x00\x00\x0dIHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
+
+
+class _ModelStub:
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+
+
+def test_image_small_under_384_uses_flat_cost():
+    """Images ≤ 384 on both sides don't tile on any provider — flat 258."""
+
+    class _FakeImage:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "image/png"
+
+    prompt = _FakePrompt("hi", attachments=[_FakeImage(_png_with_dims(300, 300))])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    # Gemini (default), Anthropic, OpenAI should all sit near 258 for a
+    # tiny image: Gemini's flat cost, Anthropic's 300*300/750=120, OpenAI's
+    # 85+170=255 for a single sub-512 tile.
+    for model in (None, _ModelStub("claude-3-5-sonnet"), _ModelStub("gpt-4o")):
+        n = count_prompt_tokens(prompt, model)
+        assert 100 <= (n - bare) <= 300, (model, n - bare)
+
+
+def test_image_large_applies_gemini_tiling_by_default():
+    """A retina-screenshot-sized PNG gets Gemini's tile formula (≫ 258)."""
+
+    class _FakeImage:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "image/png"
+
+    # 1024×768 → tile_size=512, tiles=2×2=4, tokens=4*258=1032.
+    prompt = _FakePrompt("hi", attachments=[_FakeImage(_png_with_dims(1024, 768))])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    n = count_prompt_tokens(prompt)  # no model → gemini default
+    assert 900 <= (n - bare) <= 1100
+
+
+def test_image_large_uses_anthropic_pixel_rate_for_claude():
+    """Claude models are scored at ~(W×H)/750, not Gemini tile tokens."""
+
+    class _FakeImage:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "image/png"
+
+    # 1024×768 → (1024*768)/750 ≈ 1048 tokens on Anthropic.
+    prompt = _FakePrompt("hi", attachments=[_FakeImage(_png_with_dims(1024, 768))])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    n = count_prompt_tokens(prompt, _ModelStub("claude-3-5-sonnet"))
+    assert 950 <= (n - bare) <= 1150
+
+
+def test_image_large_uses_openai_tile_formula_for_gpt():
+    """GPT-4o models are scored at 85 base + 170 per 512×512 high-detail tile."""
+
+    class _FakeImage:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "image/png"
+
+    # 1024×768 scaled so shortest side is 768 → 1024×768 (already). Tiles
+    # = ceil(1024/512) * ceil(768/512) = 2*2 = 4. Tokens = 85 + 170*4 = 765.
+    prompt = _FakePrompt("hi", attachments=[_FakeImage(_png_with_dims(1024, 768))])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    n = count_prompt_tokens(prompt, _ModelStub("gpt-4o"))
+    assert 700 <= (n - bare) <= 850
+
+
+def test_image_jpeg_dimensions_parse():
+    """The JPEG SOF0 path extracts width/height without a PIL dependency."""
+    import struct
+
+    # SOI, APP0 (minimal), SOF0 with 800×600, then EOI. SOF0 payload:
+    # length=17, precision=8, H=600, W=800, Nf=3, components(9 bytes).
+    jpeg = (
+        b"\xff\xd8"
+        + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        + b"\xff\xc0\x00\x11\x08"
+        + struct.pack(">HH", 600, 800)
+        + b"\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01"
+        + b"\xff\xd9"
+    )
+
+    class _FakeImage:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "image/jpeg"
+
+    prompt = _FakePrompt("hi", attachments=[_FakeImage(jpeg)])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    # 800×600 Gemini: tile_size=400, tiles=2×2=4, 1032 tokens.
+    n = count_prompt_tokens(prompt)
+    assert 900 <= (n - bare) <= 1100
+
+
+def test_drift_warn_fires_when_heuristic_diverges(monkeypatch, capsys):
+    """LLM_CONFIRM_TOKENS_DRIFT_WARN logs a stderr notice on significant drift."""
+    from llm_confirm_tokens import _maybe_warn_drift
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
+    # Heuristic on bare "hi" is ~1 token; exact "1000" gives a huge drift.
+    _maybe_warn_drift(1000, _FakePrompt("hi"), model=None, provider="anthropic")
+    err = capsys.readouterr().err
+    assert "heuristic" in err and "anthropic" in err and "best guess" in err
+
+
+def test_drift_warn_silent_when_unset(monkeypatch, capsys):
+    """With the env var unset, drift comparison is silent (opt-in only)."""
+    from llm_confirm_tokens import _maybe_warn_drift
+
+    monkeypatch.delenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", raising=False)
+    _maybe_warn_drift(1000, _FakePrompt("hi"), model=None, provider="anthropic")
+    assert capsys.readouterr().err == ""
+
+
+def test_drift_warn_silent_when_within_threshold(monkeypatch, capsys):
+    """No notice when heuristic is within the configured percentage band."""
+    from llm_confirm_tokens import _maybe_warn_drift
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "50")
+    # Heuristic for "hi" ≈ 1 token; exact=2 is 50% but abs delta is small;
+    # picking exact=1 (identical to heuristic) to assert the silent path.
+    _maybe_warn_drift(1, _FakePrompt("hi"), model=None, provider="anthropic")
+    assert capsys.readouterr().err == ""
 
 
 def test_count_prompt_tokens_pdf_attachment_scales_with_pages():

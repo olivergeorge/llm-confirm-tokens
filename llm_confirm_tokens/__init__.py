@@ -15,8 +15,10 @@ the behaviour of any existing script.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import struct
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -58,12 +60,12 @@ def _threshold() -> int:
         return 0
 
 
-# Per-media token constants, calibrated against Gemini 1.5/2.x documented
-# pricing (image and PDF pages both cost ~258 input tokens). These are
-# directional — different providers tokenise images differently (OpenAI
-# charges per tile, Anthropic per image region) — but 258 per image /
-# per PDF page is a defensible default for the "is this about to cost
-# me a lot?" question the plugin is trying to answer.
+# Fallback image cost used when we can't read the image's dimensions —
+# 258 matches Gemini's flat "small image" cost and is within a round
+# of the three providers' per-image baselines. When we *can* read
+# dimensions (see ``_image_dimensions``) we apply the provider-specific
+# formula in ``_image_tokens_for_provider`` instead; the flat number is
+# only the last-resort path. PDF pages still use 258 as Gemini does.
 _IMAGE_TOKENS = 258
 _PDF_TOKENS_PER_PAGE = 258
 _UNKNOWN_BINARY_TOKENS = 300
@@ -184,6 +186,159 @@ def _pdf_page_count(data: bytes) -> int:
 _TEXTY_MIMES = {"application/json", "application/xml", "application/x-yaml"}
 
 
+def _image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return ``(width, height)`` for PNG/JPEG/GIF/WebP bytes, else ``None``.
+
+    Zero-dependency format sniffing: pulls width/height straight from each
+    format's fixed-offset header so we can apply provider-specific image
+    token formulas without pulling in Pillow. ``None`` means "couldn't
+    parse" — callers fall back to a flat per-image cost rather than
+    fabricating dimensions.
+    """
+    if not data or len(data) < 24:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        try:
+            w, h = struct.unpack(">II", data[16:24])
+            return (w, h) if w > 0 and h > 0 else None
+        except struct.error:
+            return None
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+        w, h = struct.unpack("<HH", data[6:10])
+        return (w, h) if w > 0 and h > 0 else None
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8 " and len(data) >= 30:
+            w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+            h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+            return (w, h) if w > 0 and h > 0 else None
+        if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+            b = data[21:25]
+            w = 1 + (b[0] | ((b[1] & 0x3F) << 8))
+            h = 1 + ((b[1] >> 6) | (b[2] << 2) | ((b[3] & 0x0F) << 10))
+            return (w, h)
+        if chunk == b"VP8X" and len(data) >= 30:
+            w = 1 + int.from_bytes(data[24:27], "little")
+            h = 1 + int.from_bytes(data[27:30], "little")
+            return (w, h)
+        return None
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        size = len(data)
+        while i + 8 < size:
+            if data[i] != 0xFF:
+                return None
+            while i < size and data[i] == 0xFF:
+                i += 1
+            if i >= size:
+                return None
+            marker = data[i]
+            i += 1
+            # Standalone markers carry no payload.
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                continue
+            if i + 2 > size:
+                return None
+            seg_len = struct.unpack(">H", data[i : i + 2])[0]
+            # SOF0..SOFn except DHT(C4), JPG(C8), DAC(CC): payload is
+            # [len(2) precision(1) height(2) width(2) ...].
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                if seg_len < 7 or i + seg_len > size:
+                    return None
+                h, w = struct.unpack(">HH", data[i + 3 : i + 7])
+                return (w, h) if w > 0 and h > 0 else None
+            i += seg_len
+        return None
+    return None
+
+
+def _detect_provider(model: Any) -> str:
+    """Classify a model for the image-token heuristic.
+
+    Returns ``"anthropic"``, ``"openai"``, or ``"gemini"`` (the default).
+    Works off ``model_id`` string prefixes so the heuristic can pick the
+    right formula even when we're only told the model name — no adapter
+    key, no network. ``None`` and unrecognised models fall back to
+    Gemini's formula, which is the middle-of-the-road option.
+    """
+    mid = (getattr(model, "model_id", "") or "").lower() if model is not None else ""
+    if (
+        mid.startswith("claude-")
+        or mid.startswith("anthropic/")
+        or mid.startswith("claude/")
+    ):
+        return "anthropic"
+    if (
+        mid.startswith("gpt-")
+        or mid.startswith("chatgpt-")
+        or mid.startswith("o1")
+        or mid.startswith("o3")
+        or mid.startswith("o4")
+        or mid.startswith("openai/")
+    ):
+        return "openai"
+    return "gemini"
+
+
+# Anthropic: images are downscaled so the longest side is ≤ 1568 px, then
+# charged at ~(width × height) / 750 tokens. Per
+# https://docs.anthropic.com/en/docs/build-with-claude/vision.
+_ANTHROPIC_MAX_DIM = 1568
+
+
+def _anthropic_image_tokens(width: int, height: int) -> int:
+    if width <= 0 or height <= 0:
+        return _IMAGE_TOKENS
+    scale = min(1.0, _ANTHROPIC_MAX_DIM / max(width, height))
+    w, h = width * scale, height * scale
+    return max(1, round((w * h) / 750))
+
+
+# OpenAI high-detail tiling for GPT-4o-class models: scale to fit
+# 2048×2048, then scale so the shortest side is 768, then count
+# 512×512 tiles. Per https://platform.openai.com/docs/guides/vision.
+_OPENAI_IMAGE_BASE = 85
+_OPENAI_IMAGE_PER_TILE = 170
+
+
+def _openai_image_tokens(width: int, height: int) -> int:
+    if width <= 0 or height <= 0:
+        return _IMAGE_TOKENS
+    longest = max(width, height)
+    w, h = float(width), float(height)
+    if longest > 2048:
+        s = 2048 / longest
+        w, h = w * s, h * s
+    shortest = min(w, h)
+    if shortest > 768:
+        s = 768 / shortest
+        w, h = w * s, h * s
+    tiles = math.ceil(w / 512) * math.ceil(h / 512)
+    return _OPENAI_IMAGE_BASE + _OPENAI_IMAGE_PER_TILE * tiles
+
+
+# Gemini 2.x: images with both dims ≤ 384 cost 258 tokens; larger
+# images tile at tile_size = clamp(min(w, h) / 1.5, 256, 768) with
+# each tile charged at 258 tokens. Per
+# https://ai.google.dev/gemini-api/docs/tokens.
+def _gemini_image_tokens(width: int, height: int) -> int:
+    if width <= 0 or height <= 0:
+        return _IMAGE_TOKENS
+    if max(width, height) <= 384:
+        return _IMAGE_TOKENS
+    tile_size = max(256.0, min(768.0, min(width, height) / 1.5))
+    tiles = math.ceil(width / tile_size) * math.ceil(height / tile_size)
+    return tiles * _IMAGE_TOKENS
+
+
+def _image_tokens_for_provider(provider: str, width: int, height: int) -> int:
+    if provider == "anthropic":
+        return _anthropic_image_tokens(width, height)
+    if provider == "openai":
+        return _openai_image_tokens(width, height)
+    return _gemini_image_tokens(width, height)
+
+
 def _looks_like_text(decoded: str) -> bool:
     """True if the decoded string is predominantly printable characters.
 
@@ -198,10 +353,16 @@ def _looks_like_text(decoded: str) -> bool:
     return (control / len(decoded)) <= 0.05
 
 
-def _count_attachment_tokens(count: Callable[[str], int], a: Any) -> int:
+def _count_attachment_tokens(
+    count: Callable[[str], int], a: Any, provider: str = "gemini"
+) -> int:
     data = _attachment_bytes(a)
     mime = _detect_mime(a, data)
     if mime.startswith("image/"):
+        if data is not None:
+            dims = _image_dimensions(data)
+            if dims is not None:
+                return _image_tokens_for_provider(provider, *dims)
         return _IMAGE_TOKENS
     if mime == "application/pdf":
         if data is None:
@@ -219,7 +380,7 @@ def _count_attachment_tokens(count: Callable[[str], int], a: Any) -> int:
     return _UNKNOWN_BINARY_TOKENS
 
 
-def count_prompt_tokens(prompt: llm.Prompt) -> int:
+def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
     """Estimate the full token cost of ``prompt`` before it is sent.
 
     Covers the text body (system, user prompt, fragments), attachments
@@ -229,11 +390,17 @@ def count_prompt_tokens(prompt: llm.Prompt) -> int:
     JSON schema. The number is an estimate — provider-side tokenisers
     disagree on edge cases — but it catches the common "I forgot I
     attached a 4MB PDF" failure mode.
+
+    ``model`` is optional; when supplied, image attachments are scored
+    with that provider's image-token formula (Gemini tiling, Anthropic
+    pixel-rate, OpenAI tile+base). Without it, images default to
+    Gemini's rule — the middle-of-the-road option.
     """
     count = _make_counter()
+    provider = _detect_provider(model)
     tokens = count(_prompt_text(prompt))
     for a in getattr(prompt, "attachments", []) or []:
-        tokens += _count_attachment_tokens(count, a)
+        tokens += _count_attachment_tokens(count, a, provider)
     tools = getattr(prompt, "tools", []) or []
     if tools:
         tools_payload = [
@@ -266,6 +433,13 @@ def estimate_tokens_detailed(
     so the user can see when exact mode is actually taking effect and
     when it has silently degraded. Gating is a trust tool; invisible
     fallback is how trust erodes.
+
+    When ``LLM_CONFIRM_TOKENS_DRIFT_WARN`` is set and exact mode succeeds,
+    the function compares the exact count to the heuristic and writes a
+    one-line warning to stderr if they diverge beyond that percentage.
+    The heuristic is calibrated against today's provider formulas; if a
+    provider changes how it charges images, PDFs, or tools, the
+    heuristic will drift silently until this warning surfaces it.
     """
     if model is not None and _exact_mode():
         from . import _adapters
@@ -275,14 +449,58 @@ def estimate_tokens_detailed(
                 continue
             name = type(adapter).__name__.removesuffix("Adapter").lower() or "adapter"
             try:
-                return (adapter.count(prompt, model), name)
+                exact = adapter.count(prompt, model)
+                _maybe_warn_drift(exact, prompt, model, name)
+                return (exact, name)
             except Exception as exc:
                 sys.stderr.write(
                     f"llm-confirm-tokens: {name} exact-count failed "
                     f"({type(exc).__name__}: {exc}); using heuristic.\n"
                 )
                 break
-    return (count_prompt_tokens(prompt), "heuristic")
+    return (count_prompt_tokens(prompt, model), "heuristic")
+
+
+def _drift_threshold_pct() -> float | None:
+    """Parse ``LLM_CONFIRM_TOKENS_DRIFT_WARN`` as a percentage, else None."""
+    raw = os.environ.get("LLM_CONFIRM_TOKENS_DRIFT_WARN", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _maybe_warn_drift(
+    exact: int, prompt: llm.Prompt, model: Any, provider: str
+) -> None:
+    """Warn to stderr if heuristic deviates from ``exact`` by ≥ threshold.
+
+    Provides a canary for silent drift: if a provider changes its image
+    tile formula or starts billing tools differently, users won't
+    discover it from the gate itself (which now reports an exact count)
+    — only the drift warning will flag that the heuristic needs
+    re-tuning. Opt-in via env var so the extra heuristic pass has no
+    effect in the default configuration.
+    """
+    threshold = _drift_threshold_pct()
+    if threshold is None or exact <= 0:
+        return
+    try:
+        heuristic = count_prompt_tokens(prompt, model)
+    except Exception:
+        return
+    delta_pct = abs(exact - heuristic) / exact * 100
+    if delta_pct < threshold:
+        return
+    direction = "under" if heuristic < exact else "over"
+    sys.stderr.write(
+        f"llm-confirm-tokens: heuristic {heuristic:,} {direction}-counts "
+        f"vs {provider} {exact:,} by {delta_pct:.0f}% — local estimates "
+        f"are a best guess, not billing-grade.\n"
+    )
 
 
 def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:

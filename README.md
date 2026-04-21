@@ -70,7 +70,7 @@ network calls:
 | ---- | ---------- |
 | `prompt`, `system`, fragments | tiktoken (`cl100k_base`) or `len // 4` |
 | Text attachments (`text/*`, JSON, YAML, XML) | read from disk + tokenised |
-| Image attachments | 258 tokens each (matches Gemini's per-image cost) |
+| Image attachments | provider-aware formula from parsed width/height — see below |
 | PDF attachments | `pages × 258`; page count inferred from the raw bytes |
 | Tool definitions | JSON-serialised and tokenised |
 | Prior tool results | `str(output)` tokenised |
@@ -78,10 +78,39 @@ network calls:
 | URL-only attachments | flat 300 (never fetched) |
 | Unknown binary blobs | flat 300 |
 
-Numbers won't match a specific provider's internal tokeniser exactly —
-different providers charge different per-image / per-page rates — but
-they are typically within 10–30 % of `llm -u`, which is the "did I just
-attach a 200-page PDF?" signal the plugin is meant to catch.
+### Image formula by provider
+
+The heuristic parses width and height straight from the image header
+(PNG, JPEG, GIF, WebP — no Pillow dependency) and applies the
+provider's own documented formula:
+
+| Model class | Rule |
+| ----------- | ---- |
+| Gemini (default) | ≤ 384×384 → 258 tokens; otherwise `tile = clamp(min(w,h)/1.5, 256, 768)` and each tile costs 258 |
+| Anthropic `claude-*` | Downscale so longest side ≤ 1568, then `round(w × h / 750)` |
+| OpenAI `gpt-*` / `o1`/`o3`/`o4` | Fit in 2048², scale shortest side to 768, `85 + 170 × ceil(w/512) × ceil(h/512)` (high-detail tiles) |
+
+When we can't parse the image (exotic formats, corrupt bytes), each
+image falls back to a flat 258 tokens.
+
+### These are a best guess, not billing-grade
+
+Local estimates will drift from provider billing whenever a provider
+changes how it charges images, PDFs, tools, or system envelopes — and
+that happens without warning. The confirmation line prefixes heuristic
+counts with `~` (`Total tokens: ~1,032. Proceed?`) so you can see at a
+glance that this isn't a bill. Typical accuracy against `llm -u` is
+within 10–30 % when our formula matches the provider's current rule;
+expect larger gaps during pricing rollovers. For the "did I just
+attach a 200-page PDF?" failure mode the heuristic is more than enough;
+for cost accounting, use **exact mode** below.
+
+If you want to know when the heuristic is drifting on *your*
+workload, set `LLM_CONFIRM_TOKENS_DRIFT_WARN` to a percentage (e.g.
+`25`). When exact mode succeeds and the heuristic is off by at least
+that much for the provider you're using, a one-line notice goes to
+stderr — so you can re-check the numbers before trusting them in a
+heuristic-only shell.
 
 ## Exact counts (opt-in)
 
@@ -140,6 +169,7 @@ Options via environment variables:
 | `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number. `0` means confirm on every prompt. |
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
 | `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
+| `LLM_CONFIRM_TOKENS_DRIFT_WARN` | *unset* | Percentage threshold for drift warnings. When exact mode succeeds and the heuristic differs from the exact count by at least this much, a one-line notice is written to stderr. Off by default to keep the gate quiet. |
 
 The confirmation is read from `/dev/tty` (POSIX) or `CONIN$` (Windows),
 so the plugin works correctly even when `stdin` is piped
