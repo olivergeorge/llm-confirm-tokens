@@ -187,3 +187,76 @@ def test_detailed_estimator_returns_heuristic_label_when_no_exact():
     tokens, source = estimate_tokens_detailed(_FakePrompt(), model=None)
     assert tokens > 0
     assert source == "heuristic"
+
+
+def test_ask_prefers_stdin_stderr_when_both_are_ttys(monkeypatch):
+    """When both stdin and stderr are ttys, the prompt goes through
+    the standard streams — no ``/dev/tty`` open, no seek trap."""
+    writes: list[str] = []
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+        def write(self, s):
+            writes.append(s)
+
+        def flush(self):
+            pass
+
+        def readline(self):
+            return "y\n"
+
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr(sys, "stderr", _TTY())
+
+    def _fail_open(*_a, **_kw):
+        raise AssertionError("should not have opened a device file")
+
+    monkeypatch.setattr("builtins.open", _fail_open)
+
+    assert _ask_via_tty(500, source="heuristic") is True
+    assert any("~500" in w for w in writes)
+
+
+def test_ask_never_uses_readwrite_plus_mode(monkeypatch):
+    """Regression guard for the macOS ``/dev/tty`` seek bug.
+
+    Opening ``/dev/tty`` with ``'r+'`` triggers an implicit seek; macOS
+    raises ``UnsupportedOperation: File or stream is not seekable``.
+    This test stands in as a contract that the fallback path opens
+    read and write handles separately, never with ``+``.
+    """
+    modes_used: list[str] = []
+
+    class _NonTTY:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NonTTY())
+    monkeypatch.setattr(sys, "stderr", _NonTTY())
+
+    class _FakeTTY:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def write(self, s):
+            pass
+
+        def flush(self):
+            pass
+
+        def readline(self):
+            return "y\n"
+
+    def _fake_open(path, mode="r", *_a, **_kw):
+        modes_used.append(mode)
+        return _FakeTTY()
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    _ask_via_tty(100)
+    assert modes_used  # fallback path was taken
+    assert all("+" not in m for m in modes_used), modes_used

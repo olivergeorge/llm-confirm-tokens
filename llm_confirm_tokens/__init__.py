@@ -295,41 +295,63 @@ def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
     return estimate_tokens_detailed(prompt, model)[0]
 
 
-def _tty_paths() -> tuple[str, ...]:
-    """Return the platform-specific paths to try for an interactive console.
-
-    POSIX gets ``/dev/tty`` as the canonical reliable path. Windows uses
-    the ``CONIN$`` magic device, which is the console input channel even
-    when stdin has been redirected to a pipe — exactly the case the gate
-    exists for (``files-to-prompt ... | llm "...")``.
-    """
-    if sys.platform == "win32":
-        return ("CONIN$",)
-    return ("/dev/tty",)
-
-
 def _ask_via_tty(tokens: int, source: str = "heuristic") -> bool:
-    """Prompt the user on the platform's tty and return True to proceed.
+    """Prompt the user for a proceed/cancel decision and return True to proceed.
 
-    Fails **closed** when no interactive terminal is available — if the
-    plugin is enabled but the user can't be asked, declining the prompt
-    is safer than silently approving a large payload. Batch scripts that
-    want auto-approval should set ``LLM_CONFIRM_TOKENS_YES=1``, which
-    bypasses this function entirely.
+    Prefers ``sys.stdin`` + ``sys.stderr`` when both are interactive —
+    opening the console via standard streams avoids the ``r+`` seek
+    failure that bit us on macOS (``UnsupportedOperation: File or stream
+    is not seekable`` when calling ``open('/dev/tty', 'r+')``). When
+    streams have been redirected (e.g. ``cat big.txt | llm …``), falls
+    back to opening the platform's console device separately for read
+    and write so the seek issue can't recur.
+
+    Fails **closed** when no interactive terminal is available anywhere
+    — if the plugin is enabled but the user can't be asked, declining
+    the prompt is safer than silently approving a large payload. Batch
+    scripts that want auto-approval should set
+    ``LLM_CONFIRM_TOKENS_YES=1``, which bypasses this function entirely.
     """
     prefix = "~" if source == "heuristic" else ""
     suffix = "" if source == "heuristic" else f" ({source})"
     message = f"Total tokens: {prefix}{tokens:,}{suffix}. Proceed? [Y/n]: "
-    for path in _tty_paths():
+
+    # Path 1: sys.stdin + sys.stderr when both are interactive. No special
+    # file opens, no seek, and it Just Works in the majority of cases.
+    if sys.stdin.isatty() and sys.stderr.isatty():
         try:
-            with open(path, "r+") as tty:
-                tty.write(message)
-                tty.flush()
-                answer = tty.readline()
+            sys.stderr.write(message)
+            sys.stderr.flush()
+            answer = sys.stdin.readline()
+            if not answer:
+                return False  # EOF — treat as decline
+            return answer.strip().lower() in ("", "y", "yes")
         except OSError:
-            continue
-        return (answer or "").strip().lower() in ("", "y", "yes")
-    # No interactive terminal available — tell the user why we're declining.
+            pass
+
+    # Path 2: streams redirected (typical `cat big.txt | llm …`). Open the
+    # controlling terminal directly, using *separate* read and write file
+    # handles — opening once with ``r+`` triggers an implicit seek, which
+    # /dev/tty does not support on macOS.
+    tty_pair = (
+        ("CONOUT$", "CONIN$")
+        if sys.platform == "win32"
+        else ("/dev/tty", "/dev/tty")
+    )
+    out_path, in_path = tty_pair
+    try:
+        with open(out_path, "w") as tty_out, open(in_path) as tty_in:
+            tty_out.write(message)
+            tty_out.flush()
+            answer = tty_in.readline()
+        if not answer:
+            return False  # EOF
+        return answer.strip().lower() in ("", "y", "yes")
+    except OSError:
+        pass
+
+    # No interactive terminal available anywhere — tell the user why we're
+    # declining so they can fix the environment or set YES=1 explicitly.
     sys.stderr.write(
         f"llm-confirm-tokens: {prefix}{tokens:,} tokens, but no tty available "
         "to confirm. Set LLM_CONFIRM_TOKENS_YES=1 to auto-approve in "
