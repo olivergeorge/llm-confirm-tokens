@@ -95,22 +95,33 @@ image falls back to a flat 258 tokens.
 
 ### PDF per-page rate by provider
 
-Each provider processes PDFs differently, so the per-page cost differs
-significantly. The page count itself comes from counting `/Type /Page`
-markers in the PDF stream; the bytes-per-page fallback is only used
-when the PDF is compressed into an object stream and the regex returns 0.
+PDF costs are given as a **range per page**, not a single number — the
+documented rates turn out to be lower bounds for bare text pages, while
+real PDFs with embedded images hit the upper bound or higher. The
+confirmation prompt shows the range directly so you can see the
+uncertainty at a glance:
 
-Where the provider documents a specific figure we use it verbatim;
-where they don't, we infer from the image-tile formula. The drift
-warning is designed to catch real workloads that diverge from these
-documented rates — e.g. PDFs with embedded images, which Gemini
-charges separately on top of the flat per-page cost.
+```
+Total tokens: ~3,114–~12,384. Proceed? [Y/n]:
+```
 
-| Model class | Per-page | Source |
-| ----------- | -------- | ------ |
-| Gemini (default) | 258 | [Google: "each document page equals 258 tokens"](https://ai.google.dev/gemini-api/docs/document-processing) |
-| Anthropic `claude-*` | 2,250 | Midpoint of [Anthropic's documented 1,500–3,000 text tokens per page](https://platform.claude.com/docs/en/docs/build-with-claude/pdf-support) |
-| OpenAI `gpt-*` / `o1`/`o3`/`o4` | 500 | Inferred (OpenAI's [file-inputs docs](https://platform.openai.com/docs/guides/pdf-files) don't give a per-page number) |
+Text-only prompts, parseable images, and tool schemas collapse to a
+single number (`low == high`), so the range only appears when there's
+real uncertainty to communicate.
+
+| Model class | Per-page range | Source |
+| ----------- | -------------- | ------ |
+| Gemini (default) | 258 – 1,032 | [Google: "each document page equals 258 tokens"](https://ai.google.dev/gemini-api/docs/document-processing); high bound applies Gemini's own tile formula to the documented 768×768 minimum rendered page size (~4 tiles × 258). |
+| Anthropic `claude-*` | 1,500 – 3,000 | [Anthropic's documented 1,500–3,000 text tokens per page range](https://platform.claude.com/docs/en/docs/build-with-claude/pdf-support) — image tokens are charged on top, so real bills can still exceed the upper bound. |
+| OpenAI `gpt-*` / `o1`/`o3`/`o4` | 255 – 765 | Inferred (OpenAI's [file-inputs docs](https://platform.openai.com/docs/guides/pdf-files) don't give a per-page number). Low = single low-detail tile; high = high-detail letter-size page (85 + 170 × 4). |
+
+The page count itself comes from counting `/Type /Page` markers in the
+PDF stream; the bytes-per-page fallback is only used when the PDF is
+compressed into an object stream and the regex returns 0.
+
+The drift warning (`LLM_CONFIRM_TOKENS_DRIFT_WARN`) is designed to
+catch workloads that leave the range entirely — e.g. very image-heavy
+PDFs where Gemini's embedded-image billing exceeds even the high bound.
 
 ### These are a best guess, not billing-grade
 

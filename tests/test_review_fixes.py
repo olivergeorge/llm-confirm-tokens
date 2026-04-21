@@ -176,16 +176,16 @@ def test_detailed_estimator_returns_source_label_for_exact(monkeypatch):
     monkeypatch.setitem(sys.modules, "anthropic", fake_module)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
 
-    tokens, source = estimate_tokens_detailed(_FakePrompt(), _FakeClaude())
-    assert tokens == 42
+    low, high, source = estimate_tokens_detailed(_FakePrompt(), _FakeClaude())
+    assert low == 42 and high == 42
     assert source == "anthropic"
 
 
 def test_detailed_estimator_returns_heuristic_label_when_no_exact():
     """Without exact mode the source is ``heuristic`` — matches the prompt
     prefix shown to the user (``~N``)."""
-    tokens, source = estimate_tokens_detailed(_FakePrompt(), model=None)
-    assert tokens > 0
+    low, high, source = estimate_tokens_detailed(_FakePrompt(), model=None)
+    assert low > 0 and high >= low
     assert source == "heuristic"
 
 

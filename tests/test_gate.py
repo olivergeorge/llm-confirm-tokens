@@ -291,14 +291,24 @@ def test_image_jpeg_dimensions_parse():
     assert 900 <= (n - bare) <= 1100
 
 
-def test_drift_warn_fires_when_heuristic_diverges(monkeypatch, capsys):
-    """LLM_CONFIRM_TOKENS_DRIFT_WARN logs a stderr notice on significant drift."""
+def test_drift_warn_fires_when_actual_outside_range(monkeypatch, capsys):
+    """LLM_CONFIRM_TOKENS_DRIFT_WARN logs a notice when actual exits [low, high]."""
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
-    _maybe_warn_drift(actual=1000, heuristic=100, source="anthropic")
+    _maybe_warn_drift(actual=1000, low=100, high=200, source="anthropic")
     err = capsys.readouterr().err
     assert "heuristic" in err and "anthropic" in err and "best guess" in err
+    assert "under-counts" in err
+
+
+def test_drift_warn_silent_when_actual_within_range(monkeypatch, capsys):
+    """No notice when the billed count falls inside the heuristic range."""
+    from llm_confirm_tokens import _maybe_warn_drift
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
+    _maybe_warn_drift(actual=150, low=100, high=200, source="anthropic")
+    assert capsys.readouterr().err == ""
 
 
 def test_drift_warn_silent_when_unset(monkeypatch, capsys):
@@ -306,46 +316,66 @@ def test_drift_warn_silent_when_unset(monkeypatch, capsys):
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.delenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", raising=False)
-    _maybe_warn_drift(actual=1000, heuristic=100, source="anthropic")
+    _maybe_warn_drift(actual=1000, low=100, high=200, source="anthropic")
     assert capsys.readouterr().err == ""
 
 
-def test_drift_warn_silent_when_within_threshold(monkeypatch, capsys):
-    """No notice when heuristic is within the configured percentage band."""
+def test_drift_warn_silent_when_near_bound_within_threshold(monkeypatch, capsys):
+    """Actual just outside the band but within the percentage band stays silent."""
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "50")
-    _maybe_warn_drift(actual=100, heuristic=90, source="anthropic")
+    # actual=190 is below low=200, but only 5% under — well below 50% threshold.
+    _maybe_warn_drift(actual=190, low=200, high=300, source="anthropic")
     assert capsys.readouterr().err == ""
 
 
-def test_estimate_tokens_detailed_stashes_heuristic_on_prompt(monkeypatch):
-    """The public counter records the heuristic on the prompt for later compare."""
+def test_estimate_tokens_detailed_stashes_range_on_prompt(monkeypatch):
+    """The public counter records the heuristic range on the prompt for drift compare."""
     from llm_confirm_tokens import estimate_tokens_detailed
 
     monkeypatch.delenv("LLM_CONFIRM_TOKENS_EXACT", raising=False)
     prompt = _FakePrompt("hello there")
     estimate_tokens_detailed(prompt, model=None)
-    assert getattr(prompt, "_confirm_tokens_heuristic", None) is not None
+    stash = getattr(prompt, "_confirm_tokens_heuristic", None)
+    assert isinstance(stash, tuple) and len(stash) == 2
+    assert stash[0] > 0 and stash[1] >= stash[0]
 
 
-def test_after_log_to_db_warns_on_post_response_drift(monkeypatch, capsys):
-    """Billed vs heuristic drift is reported via the after_log_to_db hook."""
+def test_after_log_to_db_warns_when_billed_outside_range(monkeypatch, capsys):
+    """Billed count outside [low, high] fires the drift warning post-response."""
     from llm_confirm_tokens import after_log_to_db
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "25")
     prompt = _FakePrompt("hello")
-    prompt._confirm_tokens_heuristic = 258  # pre-flight estimate
+    prompt._confirm_tokens_heuristic = (258, 1032)  # Gemini 1-page range
     prompt._confirm_tokens_model_id = "gemini-flash-latest"
 
     class _Response:
-        input_tokens = 1080  # what the provider actually billed
+        input_tokens = 3000  # way above the range high — should warn
 
     _Response.prompt = prompt  # type: ignore[attr-defined]
     after_log_to_db(_Response(), db=None)
     err = capsys.readouterr().err
-    assert "heuristic 258" in err and "under-counts" in err
+    assert "heuristic 258–1,032" in err and "under-counts" in err
     assert "gemini-flash-latest billed" in err
+
+
+def test_after_log_to_db_silent_when_billed_inside_range(monkeypatch, capsys):
+    """Billed inside the estimated band → no warning even with threshold set."""
+    from llm_confirm_tokens import after_log_to_db
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
+    prompt = _FakePrompt("hello")
+    prompt._confirm_tokens_heuristic = (258, 1032)
+    prompt._confirm_tokens_model_id = "gemini-flash-latest"
+
+    class _Response:
+        input_tokens = 532  # inside [258, 1032]
+
+    _Response.prompt = prompt  # type: ignore[attr-defined]
+    after_log_to_db(_Response(), db=None)
+    assert capsys.readouterr().err == ""
 
 
 def test_after_log_to_db_silent_without_stash(monkeypatch, capsys):
@@ -368,7 +398,7 @@ def test_after_log_to_db_silent_when_threshold_unset(monkeypatch, capsys):
 
     monkeypatch.delenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", raising=False)
     prompt = _FakePrompt("hello")
-    prompt._confirm_tokens_heuristic = 10
+    prompt._confirm_tokens_heuristic = (10, 10)
     prompt._confirm_tokens_model_id = "claude-3-5-sonnet"
 
     class _Response:
@@ -406,10 +436,10 @@ def test_count_prompt_tokens_pdf_regex_wins_over_byte_fallback():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 5 pages * 258 (Gemini documented rate) = 1290. Old 40-page byte
-    # floor would have given ~10 320; the band below locks out that
-    # regression while tolerating a small drift in the per-page constant.
-    assert 1000 < (n - bare) < 1600
+    # count_prompt_tokens returns the high bound. 5 pages * 1032 (Gemini
+    # per-page high, image-heavy case) = 5160. Old 40-page byte floor
+    # would have given ~40 * 1032 = 41 280 high; the band locks out that.
+    assert 4500 < (n - bare) < 5800
 
 
 def test_count_prompt_tokens_pdf_byte_fallback_when_regex_blind():
@@ -427,10 +457,9 @@ def test_count_prompt_tokens_pdf_byte_fallback_when_regex_blind():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 500_000 // 50_000 = 10 pages * 258 (Gemini documented) = 2580.
-    # Must be non-zero since we know there's a PDF attached even if we
-    # couldn't parse it.
-    assert 2300 < (n - bare) < 2900
+    # High bound: 10 pages * 1032 (Gemini) = 10 320. Must be non-zero
+    # since we know there's a PDF attached even if we couldn't parse it.
+    assert 9500 < (n - bare) < 11_000
 
 
 def test_count_prompt_tokens_pdf_attachment_scales_with_pages():
@@ -448,12 +477,32 @@ def test_count_prompt_tokens_pdf_attachment_scales_with_pages():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 10 pages * 258 (Gemini documented rate) = 2580.
-    assert 2300 < (n - bare) < 2900
+    # count_prompt_tokens returns the high bound: 10 pages * 1032 = 10 320.
+    assert 9500 < (n - bare) < 11_000
+
+
+def test_count_prompt_tokens_pdf_range_has_width():
+    """The low/high Gemini range widens on PDFs so the display shows uncertainty."""
+    from llm_confirm_tokens import count_prompt_tokens_range
+
+    class _FakePdf:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "application/pdf"
+
+    pdf_bytes = b"%PDF-1.4\n" + (b"/Type /Page\n" * 10) + b"%%EOF"
+    prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
+    low, high = count_prompt_tokens_range(prompt)
+    # Gemini per-page range (258, 1032) × 10 pages + ~1 text token.
+    assert 2580 <= low <= 2600
+    assert 10_320 <= high <= 10_340
+    assert high > low  # range must be a range for PDFs
 
 
 def test_count_prompt_tokens_pdf_anthropic_uses_higher_rate():
-    """Claude charges ~2250 tokens/page — much higher than Gemini's flat rate."""
+    """Claude documents 1,500–3,000 text tokens/page — range is much wider."""
 
     class _FakePdf:
         def __init__(self, content):
@@ -466,9 +515,8 @@ def test_count_prompt_tokens_pdf_anthropic_uses_higher_rate():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt, _ModelStub("claude-3-5-sonnet"))
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 10 pages * 2250 = 22 500 — midpoint of Anthropic's documented
-    # 1,500–3,000 text-tokens-per-page range.
-    assert 21_000 < (n - bare) < 24_000
+    # High bound: 10 pages * 3000 (upper end of docs range) = 30 000.
+    assert 28_000 < (n - bare) < 32_000
 
 
 def test_count_prompt_tokens_pdf_openai_uses_tile_rate():
@@ -485,8 +533,8 @@ def test_count_prompt_tokens_pdf_openai_uses_tile_rate():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt, _ModelStub("gpt-4o"))
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 10 pages * 500 ≈ 5000.
-    assert 4500 < (n - bare) < 5500
+    # High bound: 10 pages * 765 (85 + 170*4 high-detail tile) = 7650.
+    assert 7000 < (n - bare) < 8500
 
 
 def test_count_prompt_tokens_unknown_binary_falls_back():

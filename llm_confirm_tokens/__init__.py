@@ -91,15 +91,36 @@ _UNKNOWN_BINARY_TOKENS = 300
 #   https://platform.openai.com/docs/guides/pdf-files. Keep the
 #   inferred ~500/page (aligns with high-detail tile cost for a
 #   letter-sized rendered page via OpenAI's standard image formula).
-_PDF_TOKENS_PER_PAGE = {
-    "gemini": 258,
-    "anthropic": 2250,
-    "openai": 500,
+# Per-provider PDF per-page ranges. The low bound is what the provider
+# documents for a bare text page; the high bound accounts for the
+# image/tile component real PDFs routinely hit. The confirmation prompt
+# shows the range directly when it's material, so users see "this might
+# cost between X and Y" rather than a single number that's often wrong.
+#
+# - Gemini: low=258 (docs: "each document page equals 258 tokens").
+#   high=1032 applies Gemini's image-tile formula to the documented
+#   768×768 minimum render size (4 tiles × 258), which bounds the
+#   image-containing case observed empirically (~532/page).
+# - Anthropic: explicit 1,500-3,000 text-token range from docs.
+#   Image tokens are charged on top at an undocumented render size
+#   — the 3,000 upper bound is known to be a text-only lower-bound
+#   of reality when pages contain images, so drift still fires for
+#   those cases.
+# - OpenAI: low=255 (single low-detail tile via 85+170); high=765
+#   (high-detail letter-size: 85+170×4). No authoritative per-page
+#   number; the range mirrors OpenAI's documented image-tile
+#   formula for a rendered page.
+_PDF_TOKENS_PER_PAGE_RANGE: dict[str, tuple[int, int]] = {
+    "gemini": (258, 1032),
+    "anthropic": (1500, 3000),
+    "openai": (255, 765),
 }
 
 
-def _pdf_tokens_per_page(provider: str) -> int:
-    return _PDF_TOKENS_PER_PAGE.get(provider, _PDF_TOKENS_PER_PAGE["gemini"])
+def _pdf_tokens_per_page_range(provider: str) -> tuple[int, int]:
+    return _PDF_TOKENS_PER_PAGE_RANGE.get(
+        provider, _PDF_TOKENS_PER_PAGE_RANGE["gemini"]
+    )
 
 # PDF /Type /Page entries: accurate for uncompressed PDFs, an under-count
 # for PDFs whose object streams are compressed. The byte-size fallback in
@@ -389,55 +410,68 @@ def _looks_like_text(decoded: str) -> bool:
     return (control / len(decoded)) <= 0.05
 
 
-def _count_attachment_tokens(
+def _count_attachment_range(
     count: Callable[[str], int], a: Any, provider: str = "gemini"
-) -> int:
+) -> tuple[int, int]:
+    """Return ``(low, high)`` token cost for one attachment.
+
+    A collapsed tuple (``low == high``) means we have an exact value;
+    a widened tuple means the attachment type has inherent uncertainty
+    (PDFs hit per-page ranges depending on embedded image content,
+    image attachments we can't measure fall back to a provider-range
+    envelope). The prompt-level counter sums these and collapses the
+    result for display.
+    """
     data = _attachment_bytes(a)
     mime = _detect_mime(a, data)
     if mime.startswith("image/"):
         if data is not None:
             dims = _image_dimensions(data)
             if dims is not None:
-                return _image_tokens_for_provider(provider, *dims)
-        return _IMAGE_TOKENS
+                exact = _image_tokens_for_provider(provider, *dims)
+                return (exact, exact)
+        # No dims parsed → fall back to a flat per-image estimate. Keep
+        # it single-valued rather than provider-specific range to avoid
+        # widening every image attachment; the drift warning covers the
+        # miss if a provider bills radically differently.
+        return (_IMAGE_TOKENS, _IMAGE_TOKENS)
     if mime == "application/pdf":
-        per_page = _pdf_tokens_per_page(provider)
-        if data is None:
-            return per_page
-        return _pdf_page_count(data) * per_page
+        low, high = _pdf_tokens_per_page_range(provider)
+        pages = _pdf_page_count(data) if data is not None else 1
+        return (pages * low, pages * high)
     if data is None:
-        return _UNKNOWN_BINARY_TOKENS
+        return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
     texty_by_mime = mime.startswith("text/") or mime in _TEXTY_MIMES
     try:
         decoded = data.decode("utf-8")
     except UnicodeDecodeError:
-        return _UNKNOWN_BINARY_TOKENS
+        return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
     if texty_by_mime or _looks_like_text(decoded):
-        return count(decoded)
-    return _UNKNOWN_BINARY_TOKENS
+        n = count(decoded)
+        return (n, n)
+    return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
 
 
-def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
-    """Estimate the full token cost of ``prompt`` before it is sent.
+def count_prompt_tokens_range(
+    prompt: llm.Prompt, model: Any = None
+) -> tuple[int, int]:
+    """Return ``(low, high)`` token cost for ``prompt``.
 
-    Covers the text body (system, user prompt, fragments), attachments
-    (text attachments decoded and tokenised; binary or URL-only
-    attachments charged a flat ``_BINARY_ATTACHMENT_TOKENS``), tool
-    schemas, tool results from prior turns, and any structured-output
-    JSON schema. The number is an estimate — provider-side tokenisers
-    disagree on edge cases — but it catches the common "I forgot I
-    attached a 4MB PDF" failure mode.
-
-    ``model`` is optional; when supplied, image attachments are scored
-    with that provider's image-token formula (Gemini tiling, Anthropic
-    pixel-rate, OpenAI tile+base). Without it, images default to
-    Gemini's rule — the middle-of-the-road option.
+    ``low == high`` means the count has no attachment-driven
+    uncertainty (text-only prompts, parseable images, etc.); a widened
+    range means at least one attachment has inherent uncertainty (PDFs
+    always; image-dim parse failures would too if we widened them).
+    Callers that want a single number can use :func:`count_prompt_tokens`
+    (returns the ``high`` bound — the conservative choice for gating).
     """
     count = _make_counter()
     provider = _detect_provider(model)
-    tokens = count(_prompt_text(prompt))
+    text_tokens = count(_prompt_text(prompt))
+    low = high = text_tokens
     for a in getattr(prompt, "attachments", []) or []:
-        tokens += _count_attachment_tokens(count, a, provider)
+        a_low, a_high = _count_attachment_range(count, a, provider)
+        low += a_low
+        high += a_high
     tools = getattr(prompt, "tools", []) or []
     if tools:
         tools_payload = [
@@ -448,15 +482,33 @@ def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
             }
             for t in tools
         ]
-        tokens += count(json.dumps(tools_payload, default=str))
+        n = count(json.dumps(tools_payload, default=str))
+        low += n
+        high += n
     for tr in getattr(prompt, "tool_results", []) or []:
         out = getattr(tr, "output", None)
         if out:
-            tokens += count(str(out))
+            n = count(str(out))
+            low += n
+            high += n
     schema = getattr(prompt, "schema", None)
     if schema is not None:
-        tokens += count(json.dumps(schema, default=str))
-    return tokens
+        n = count(json.dumps(schema, default=str))
+        low += n
+        high += n
+    return (low, high)
+
+
+def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
+    """Estimate the full token cost of ``prompt`` before it is sent.
+
+    Returns the ``high`` bound from :func:`count_prompt_tokens_range`
+    — the conservative choice for gating, since the gate's "did I
+    really mean to send this much?" question is better answered
+    pessimistically. Callers that want both ends of the band should
+    call :func:`count_prompt_tokens_range` directly.
+    """
+    return count_prompt_tokens_range(prompt, model)[1]
 
 
 _DRIFT_STASH_ATTR = "_confirm_tokens_heuristic"
@@ -465,25 +517,27 @@ _DRIFT_MODEL_STASH_ATTR = "_confirm_tokens_model_id"
 
 def estimate_tokens_detailed(
     prompt: llm.Prompt, model: Any = None
-) -> tuple[int, str]:
-    """Return ``(tokens, source)`` where source is ``"heuristic"`` or the
-    provider name when an exact-count adapter produced the figure.
+) -> tuple[int, int, str]:
+    """Return ``(low, high, source)`` for a pre-flight estimate of ``prompt``.
 
-    Adapter failures fall through to the local heuristic, but unlike the
-    v0 behaviour they are *not* silent: a one-line notice goes to stderr
-    so the user can see when exact mode is actually taking effect and
-    when it has silently degraded. Gating is a trust tool; invisible
-    fallback is how trust erodes.
+    ``low == high`` means either exact mode produced a definitive count
+    or the prompt has no attachment-driven uncertainty (text, parseable
+    images, tools). Heuristic mode widens the range for PDFs, where
+    documented per-page rates and real billing diverge materially.
 
-    The heuristic is always computed and stashed on the prompt so the
-    ``after_log_to_db`` hook can compare it against the billed count
-    once the response arrives. That makes drift detection work even
-    in heuristic-only mode — which is the mode where it matters most,
-    because that's where users have no ground truth to sanity-check
-    against locally.
+    Source is ``"heuristic"`` or the provider name when an exact-count
+    adapter produced the figure. Adapter failures fall through to the
+    local heuristic, but are *not* silent — a one-line notice goes to
+    stderr so degradation is visible.
+
+    The heuristic range is always computed and stashed on the prompt so
+    the ``after_log_to_db`` hook can compare it against the billed count
+    once the response arrives. That makes drift detection work even in
+    heuristic-only mode — the mode where it matters most, because that's
+    where users have no ground truth to sanity-check against locally.
     """
-    heuristic = count_prompt_tokens(prompt, model)
-    _stash_heuristic(prompt, heuristic, model)
+    low, high = count_prompt_tokens_range(prompt, model)
+    _stash_heuristic(prompt, low, high, model)
 
     if model is not None and _exact_mode():
         from . import _adapters
@@ -494,15 +548,15 @@ def estimate_tokens_detailed(
             name = type(adapter).__name__.removesuffix("Adapter").lower() or "adapter"
             try:
                 exact = adapter.count(prompt, model)
-                _maybe_warn_drift(exact, heuristic, name)
-                return (exact, name)
+                _maybe_warn_drift(exact, low, high, name)
+                return (exact, exact, name)
             except Exception as exc:
                 sys.stderr.write(
                     f"llm-confirm-tokens: {name} exact-count failed "
                     f"({type(exc).__name__}: {exc}); using heuristic.\n"
                 )
                 break
-    return (heuristic, "heuristic")
+    return (low, high, "heuristic")
 
 
 def _drift_threshold_pct() -> float | None:
@@ -517,55 +571,89 @@ def _drift_threshold_pct() -> float | None:
     return value if value > 0 else None
 
 
-def _stash_heuristic(prompt: llm.Prompt, heuristic: int, model: Any) -> None:
-    """Record the pre-flight heuristic on the prompt for after-response drift.
+def _stash_heuristic(
+    prompt: llm.Prompt, low: int, high: int, model: Any
+) -> None:
+    """Record the pre-flight heuristic range on the prompt for drift compare.
 
-    Uses a dunder-ish attribute name to make it clear this isn't part of
-    llm's public Prompt contract. Wrapped in try/except so a frozen or
-    slotted Prompt subclass can't break gating.
+    Stores the full ``(low, high)`` so ``after_log_to_db`` can tell
+    whether the billed number landed inside the estimate's band (no
+    drift) or outside it (worth warning about). Wrapped in try/except
+    so a frozen or slotted Prompt subclass can't break gating.
     """
     try:
-        setattr(prompt, _DRIFT_STASH_ATTR, heuristic)
+        setattr(prompt, _DRIFT_STASH_ATTR, (low, high))
         setattr(prompt, _DRIFT_MODEL_STASH_ATTR, getattr(model, "model_id", None))
     except Exception:
         pass
 
 
-def _maybe_warn_drift(actual: int, heuristic: int, source: str) -> None:
-    """Warn to stderr if heuristic deviates from ``actual`` by ≥ threshold.
+def _maybe_warn_drift(
+    actual: int, low: int, high: int, source: str
+) -> None:
+    """Warn to stderr when ``actual`` falls outside the heuristic range.
 
-    ``source`` names the ground-truth channel — ``"gemini"`` /
-    ``"anthropic"`` / ``"openai"`` for the pre-flight exact-count path,
-    or ``"<model_id> billed"`` for the post-response path. The same
-    formatter is used from both sites so the warning reads the same way
-    regardless of when drift was detected.
+    The heuristic expresses a band of plausible costs; drift only
+    matters when reality leaves that band. When it does, we report the
+    percentage gap to the nearest bound — which is the "how wrong were
+    we at best?" figure, not a worst-case comparison. ``source`` names
+    the ground-truth channel (``"gemini"`` / ``"anthropic"`` /
+    ``"openai"`` for the pre-flight exact-count path, or
+    ``"<model_id> billed"`` for the post-response path).
     """
     threshold = _drift_threshold_pct()
     if threshold is None or actual <= 0:
         return
-    delta_pct = abs(actual - heuristic) / actual * 100
+    if low <= actual <= high:
+        return
+    if actual < low:
+        near, direction = low, "over"
+    else:
+        near, direction = high, "under"
+    delta_pct = abs(actual - near) / actual * 100
     if delta_pct < threshold:
         return
-    direction = "under" if heuristic < actual else "over"
+    heuristic_str = f"{low:,}" if low == high else f"{low:,}–{high:,}"
     sys.stderr.write(
-        f"llm-confirm-tokens: heuristic {heuristic:,} {direction}-counts "
+        f"llm-confirm-tokens: heuristic {heuristic_str} {direction}-counts "
         f"vs {source} {actual:,} by {delta_pct:.0f}% — local estimates "
         f"are a best guess, not billing-grade.\n"
     )
 
 
 def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
-    """Return a pre-flight token estimate for ``prompt``.
+    """Return a pre-flight token estimate for ``prompt`` (upper bound).
 
     Thin wrapper over :func:`estimate_tokens_detailed` for callers that
-    only want the number. The gate uses the detailed form so it can
-    indicate in the confirmation prompt whether the figure is exact.
+    only want a single number — returns the high bound of the range,
+    matching :func:`count_prompt_tokens`.
     """
-    return estimate_tokens_detailed(prompt, model)[0]
+    _, high, _ = estimate_tokens_detailed(prompt, model)
+    return high
 
 
-def _ask_via_tty(tokens: int, source: str = "heuristic") -> bool:
+def _format_total(low: int, high: int, source: str) -> str:
+    """Format ``{prefix}low-high`` or ``{prefix}N`` for the prompt message."""
+    prefix = "~" if source == "heuristic" else ""
+    suffix = "" if source == "heuristic" else f" ({source})"
+    if low == high:
+        return f"{prefix}{high:,}{suffix}"
+    return f"{prefix}{low:,}–{prefix}{high:,}{suffix}"
+
+
+def _ask_via_tty(
+    low: int, high: int | None = None, source: str = "heuristic"
+) -> bool:
     """Prompt the user for a proceed/cancel decision and return True to proceed.
+
+    ``high`` defaults to ``low`` so legacy callers that pass a single
+    number still work (``_ask_via_tty(1234, source="heuristic")``).
+
+    Shows a single number when the estimate has no attachment-driven
+    uncertainty (``low == high``) and a ``low-high`` range otherwise —
+    letting users see where our confidence is wider than a point estimate
+    implies. The ``~`` prefix still signals "heuristic, not billing-grade"
+    regardless of whether a range is displayed.
 
     Prefers ``sys.stdin`` + ``sys.stderr`` when both are interactive —
     opening the console via standard streams avoids the ``r+`` seek
@@ -581,9 +669,10 @@ def _ask_via_tty(tokens: int, source: str = "heuristic") -> bool:
     scripts that want auto-approval should set
     ``LLM_CONFIRM_TOKENS_YES=1``, which bypasses this function entirely.
     """
-    prefix = "~" if source == "heuristic" else ""
-    suffix = "" if source == "heuristic" else f" ({source})"
-    message = f"Total tokens: {prefix}{tokens:,}{suffix}. Proceed? [Y/n]: "
+    if high is None:
+        high = low
+    total = _format_total(low, high, source)
+    message = f"Total tokens: {total}. Proceed? [Y/n]: "
 
     # Path 1: sys.stdin + sys.stderr when both are interactive. No special
     # file opens, no seek, and it Just Works in the majority of cases.
@@ -622,7 +711,7 @@ def _ask_via_tty(tokens: int, source: str = "heuristic") -> bool:
     # No interactive terminal available anywhere — tell the user why we're
     # declining so they can fix the environment or set YES=1 explicitly.
     sys.stderr.write(
-        f"llm-confirm-tokens: {prefix}{tokens:,} tokens, but no tty available "
+        f"llm-confirm-tokens: {total} tokens, but no tty available "
         "to confirm. Set LLM_CONFIRM_TOKENS_YES=1 to auto-approve in "
         "non-interactive environments.\n"
     )
@@ -636,11 +725,11 @@ class ConfirmTokensGate:
     (exact counts for providers that support them, heuristic otherwise, and
     platform-appropriate tty prompting) are used.
 
-    ``tokens_fn`` receives ``(prompt, model)``; legacy callers that pass a
-    single-argument function are still accepted. ``ask`` receives
-    ``(tokens, source)`` where source is ``"heuristic"`` or the provider
-    adapter name; legacy single-argument ``ask`` callables are also
-    accepted so in-process test code doesn't have to change.
+    ``tokens_fn`` may return ``int`` (legacy — treated as ``low == high``),
+    ``(int, str)`` legacy ``(tokens, source)``, ``(low, high)``, or
+    ``(low, high, source)``. ``ask`` may accept ``(low, high, source)``
+    (preferred), ``(tokens, source)``, or ``(tokens,)`` — we try each
+    shape in order so older test code keeps working.
     """
 
     def __init__(
@@ -654,16 +743,14 @@ class ConfirmTokensGate:
         self._tokens_fn = tokens_fn
         self._ask = ask or _ask_via_tty
 
-    def _count(self, prompt: llm.Prompt, model: Any) -> tuple[int, str]:
-        """Return ``(tokens, source)``.
+    def _count(self, prompt: llm.Prompt, model: Any) -> tuple[int, int, str]:
+        """Return ``(low, high, source)``.
 
         When no ``tokens_fn`` was injected, we call
         :func:`estimate_tokens_detailed` directly so the true source
-        ("heuristic", "anthropic", "gemini", "openai") flows through
-        to the confirmation message. Injected counters that return
-        just an int (typical for tests) are labelled "heuristic" by
-        convention; injected counters can return a ``(tokens, source)``
-        tuple if they want to control the label.
+        ("heuristic", "anthropic", "gemini", "openai") and the real
+        range (wider on PDFs, collapsed elsewhere) both flow through
+        to the confirmation message.
         """
         if self._tokens_fn is None:
             return estimate_tokens_detailed(prompt, model)
@@ -671,24 +758,51 @@ class ConfirmTokensGate:
             result = self._tokens_fn(prompt, model)
         except TypeError:
             result = self._tokens_fn(prompt)
-        if isinstance(result, tuple):
-            return result  # type: ignore[return-value]
-        return (int(result), "heuristic")
+        return _normalise_tokens_result(result)
 
-    def _invoke_ask(self, tokens: int, source: str) -> bool:
-        try:
-            return self._ask(tokens, source)
-        except TypeError:
-            return self._ask(tokens)
+    def _invoke_ask(self, low: int, high: int, source: str) -> bool:
+        for args in ((low, high, source), (high, source), (high,)):
+            try:
+                return self._ask(*args)
+            except TypeError:
+                continue
+        return self._ask(high)
 
     def check(self, prompt: llm.Prompt, model: Any) -> None:
-        tokens, source = self._count(prompt, model)
-        if tokens < self.threshold:
+        low, high, source = self._count(prompt, model)
+        # Gate conservatively on the high bound — the "did I really
+        # mean to send this much?" question is better answered
+        # pessimistically when the estimate has a width.
+        if high < self.threshold:
             return
         if _assume_yes():
             return
-        if not self._invoke_ask(tokens, source):
-            raise llm.CancelPrompt(f"user declined {tokens:,} token prompt")
+        if not self._invoke_ask(low, high, source):
+            total = _format_total(low, high, source)
+            raise llm.CancelPrompt(f"user declined {total} token prompt")
+
+
+def _normalise_tokens_result(result: Any) -> tuple[int, int, str]:
+    """Coerce any supported ``tokens_fn`` return shape into ``(low, high, source)``.
+
+    Accepts ``int``, ``(low, high)``, ``(tokens, source)``, and
+    ``(low, high, source)`` so pre-range-API tests still work. Invalid
+    shapes fall back to treating the first element as both low and high
+    under the "heuristic" label rather than raising — robustness matters
+    more than strictness in a gate path.
+    """
+    if isinstance(result, tuple):
+        if len(result) == 3:
+            low, high, source = result
+            return (int(low), int(high), str(source))
+        if len(result) == 2:
+            a, b = result
+            if isinstance(b, str):
+                n = int(a)
+                return (n, n, b)
+            return (int(a), int(b), "heuristic")
+    n = int(result)
+    return (n, n, "heuristic")
 
 
 @hookimpl
@@ -719,11 +833,16 @@ def after_log_to_db(response: Any, db: Any) -> None:
     prompt = getattr(response, "prompt", None)
     if prompt is None:
         return
-    heuristic = getattr(prompt, _DRIFT_STASH_ATTR, None)
-    if heuristic is None:
+    stash = getattr(prompt, _DRIFT_STASH_ATTR, None)
+    if stash is None:
         return
+    if isinstance(stash, tuple):
+        low, high = stash
+    else:
+        # Pre-range API stash was a bare int — treat as a collapsed range.
+        low = high = int(stash)
     actual = getattr(response, "input_tokens", None)
     if actual is None or actual <= 0:
         return
     model_id = getattr(prompt, _DRIFT_MODEL_STASH_ATTR, None) or "model"
-    _maybe_warn_drift(int(actual), int(heuristic), f"{model_id} billed")
+    _maybe_warn_drift(int(actual), int(low), int(high), f"{model_id} billed")
