@@ -26,7 +26,7 @@ class Adapter(Protocol):
 def iter_adapters() -> Iterable[Adapter]:
     """Adapters in priority order. Order only matters if a model could
     plausibly match two providers, which is currently impossible."""
-    return (AnthropicAdapter(),)
+    return (AnthropicAdapter(), GeminiAdapter())
 
 
 def _get_anthropic_key() -> str | None:
@@ -180,3 +180,132 @@ class AnthropicAdapter:
 
         response = client.messages.count_tokens(**kwargs)
         return int(response.input_tokens)
+
+
+def _get_gemini_key() -> str | None:
+    """Resolve a Gemini API key from the environment or llm's keyring."""
+    for env in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        v = os.environ.get(env)
+        if v:
+            return v
+    try:
+        import llm
+
+        for alias in ("gemini", "google"):
+            try:
+                return llm.get_key("", alias, "GEMINI_API_KEY")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _gemini_part_from_attachment(a: Any) -> dict | None:
+    """Turn an llm.Attachment into a Gemini Part dict.
+
+    URL-only attachments are skipped (no network fetches from the
+    plugin). Returns ``None`` to signal "drop this attachment and let
+    the caller proceed without it" — a small under-count is preferable
+    to a surprise HTTP call.
+    """
+    mime = getattr(a, "type", None)
+    content = getattr(a, "content", None)
+    path = getattr(a, "path", None)
+    if not mime and path:
+        try:
+            from llm.utils import mimetype_from_path
+
+            mime = mimetype_from_path(path) or ""
+        except Exception:
+            mime = ""
+    if content is None and path:
+        try:
+            from pathlib import Path
+
+            content = Path(path).read_bytes()
+        except OSError:
+            content = None
+    if content is None:
+        return None
+    if mime and (mime.startswith("image/") or mime == "application/pdf"):
+        return {
+            "inline_data": {
+                "mime_type": mime,
+                "data": base64.b64encode(content).decode("ascii"),
+            }
+        }
+    try:
+        return {"text": content.decode("utf-8")}
+    except UnicodeDecodeError:
+        return None
+
+
+class GeminiAdapter:
+    """Exact token counts via ``google.genai.Client.models.count_tokens``.
+
+    Matches any model whose ``model_id`` looks Gemini-shaped (the
+    ``gemini-`` prefix, or an ``llm-gemini``-style ``gemini/…`` alias)
+    or whose implementing class comes from ``llm_gemini``. Builds a
+    single user Content with text + fragments + text/image/PDF
+    attachments and returns ``response.total_tokens``.
+
+    System prompt is prepended as a leading text Part rather than set
+    via ``GenerateContentConfig``; the payload shape is simpler, and
+    Gemini tokenises system and user text the same way, so the count
+    matches what ``generate_content`` would bill. Tools and tool
+    results are not included: the Gemini tool-calling format requires
+    a multi-turn message history whose invariants count_tokens
+    validates, and the over-count risk isn't worth the adapter
+    complexity. Callers that need exact counts for tool-heavy prompts
+    can extend this adapter.
+    """
+
+    def matches(self, model: Any) -> bool:
+        mid = getattr(model, "model_id", "") or ""
+        if mid.startswith("gemini-") or mid.startswith("gemini/") or "/gemini-" in mid:
+            return True
+        return (type(model).__module__ or "").startswith("llm_gemini")
+
+    def _model_id(self, model: Any) -> str:
+        mid = getattr(model, "model_id", "") or ""
+        for prefix in ("gemini/", "google/"):
+            if mid.startswith(prefix):
+                return mid[len(prefix) :]
+        return mid
+
+    def count(self, prompt: Any, model: Any) -> int:
+        from google import genai
+
+        api_key = _get_gemini_key()
+        client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+        parts: list[dict] = []
+        system_parts: list[str] = []
+        system = getattr(prompt, "system", None)
+        if system:
+            system_parts.append(system)
+        for sf in getattr(prompt, "system_fragments", []) or []:
+            system_parts.append(str(sf))
+        if system_parts:
+            parts.append({"text": "\n".join(system_parts)})
+
+        body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
+        if body:
+            parts.append({"text": body})
+        for f in getattr(prompt, "fragments", []) or []:
+            parts.append({"text": str(f)})
+        for a in getattr(prompt, "attachments", []) or []:
+            part = _gemini_part_from_attachment(a)
+            if part is not None:
+                parts.append(part)
+
+        if not parts:
+            parts = [{"text": ""}]
+
+        contents = [{"role": "user", "parts": parts}]
+        response = client.models.count_tokens(
+            model=self._model_id(model),
+            contents=contents,
+        )
+        return int(response.total_tokens)

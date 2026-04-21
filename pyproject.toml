@@ -32,6 +32,11 @@ tiktoken = ["tiktoken"]
 # LLM_CONFIRM_TOKENS_EXACT=1.
 anthropic = ["anthropic>=0.40"]
 
+# Exact pre-flight counts for Gemini models via google-genai's
+# Client.models.count_tokens. Enable at runtime with
+# LLM_CONFIRM_TOKENS_EXACT=1.
+gemini = ["google-genai>=0.3"]
+
 [project.entry-points.llm]
 llm_confirm_tokens = "llm_confirm_tokens"
 

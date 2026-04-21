@@ -58,28 +58,42 @@ different providers charge different per-image / per-page rates — but
 they are typically within 10–30 % of `llm -u`, which is the "did I just
 attach a 200-page PDF?" signal the plugin is meant to catch.
 
-## Exact counts for Claude (opt-in)
+## Exact counts (opt-in)
 
-If you want billing-grade accuracy for Claude models — including images,
-PDFs, and tool schemas — install the `anthropic` extra and set
+If you want billing-grade accuracy — including images, PDFs, and tool
+schemas — install the extra for your provider and set
 `LLM_CONFIRM_TOKENS_EXACT=1`:
 
 ```bash
-llm install 'llm-confirm-tokens[anthropic]'
+llm install 'llm-confirm-tokens[anthropic]'   # Claude models
+llm install 'llm-confirm-tokens[gemini]'      # Gemini models
+
 export LLM_CONFIRM_TOKENS=1
 export LLM_CONFIRM_TOKENS_EXACT=1
 ```
 
-When exact mode is on, a Claude model prompt is sent to Anthropic's
-free [`/v1/messages/count_tokens`](https://docs.anthropic.com/en/api/messages-count-tokens)
-endpoint before the real call. One extra round-trip (~100–300ms) per
-gated prompt, no billing. Anything that doesn't match — non-Claude
-models, SDK missing, key missing, network error — silently falls back
-to the local heuristic, so turning exact mode on never breaks gating.
+When exact mode is on and the model matches a registered adapter, the
+plugin calls the provider's free pre-flight count endpoint before the
+real request:
 
-URL-only attachments are deliberately not fetched by the adapter (same
-as the heuristic) — the plugin never makes pre-flight HTTP calls of
-its own beyond the single `count_tokens` request.
+| Provider | Endpoint | SDK | Extra |
+| -------- | -------- | --- | ----- |
+| Anthropic | [`/v1/messages/count_tokens`](https://docs.anthropic.com/en/api/messages-count-tokens) | `anthropic` | `[anthropic]` |
+| Google Gemini | `Client.models.count_tokens` | `google-genai` | `[gemini]` |
+
+One extra round-trip (~100–300 ms) per gated prompt, no billing.
+Anything that doesn't match — non-matching model, SDK missing, key
+missing, network error — silently falls back to the local heuristic,
+so turning exact mode on never breaks gating.
+
+Keys are resolved first from the canonical env var
+(`ANTHROPIC_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`) and then
+from llm's own keyring, so no extra configuration is needed for
+users who already have `llm keys set` configured.
+
+URL-only attachments are deliberately not fetched (same as the
+heuristic) — the plugin never makes pre-flight HTTP calls of its own
+beyond the single `count_tokens` request.
 
 ## Enable
 
