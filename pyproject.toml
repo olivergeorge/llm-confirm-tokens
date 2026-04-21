@@ -35,7 +35,9 @@ anthropic = ["anthropic>=0.40"]
 # Exact pre-flight counts for Gemini models via google-genai's
 # Client.models.count_tokens. Enable at runtime with
 # LLM_CONFIRM_TOKENS_EXACT=1.
-gemini = ["google-genai>=0.3"]
+# ``>=1.0`` pins past the pre-1.0 API churn around GenerateContentConfig /
+# CountTokensConfig — the adapter uses types.CountTokensConfig directly.
+gemini = ["google-genai>=1.0"]
 
 # Exact pre-flight counts for OpenAI models via
 # client.responses.input_tokens.count. Requires a recent openai SDK

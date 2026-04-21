@@ -125,10 +125,14 @@ def test_adapter_sends_text_prompt_and_returns_total_tokens(fake_genai):
     ]
 
 
-def test_adapter_prepends_system_as_leading_text_part(fake_genai):
-    """System prompt goes into the contents as a leading text part rather
-    than via GenerateContentConfig, which keeps the payload stable across
-    minor SDK revisions and matches how Gemini tokenises either way."""
+def test_adapter_prepends_system_as_leading_text_parts(fake_genai):
+    """System prompt and system_fragments go in as leading user-role text
+    parts — one part each, not a pre-joined block — because
+    ``CountTokensConfig.system_instruction`` is rejected by several
+    Gemini models (e.g. ``gemini-flash-lite``) even when the same
+    models accept it on ``generate_content``. Inlining keeps the
+    adapter model-agnostic.
+    """
     adapter = GeminiAdapter()
     adapter.count(
         _FakePrompt(
@@ -139,8 +143,13 @@ def test_adapter_prepends_system_as_leading_text_part(fake_genai):
         ),
         _FakeGemini(),
     )
-    parts = fake_genai[0]["contents"][0]["parts"]
-    assert parts[0] == {"text": "you are helpful\nextra system"}
+    payload = fake_genai[0]
+    # The config kwarg must not be set — otherwise the flash-lite class
+    # of models rejects the request at the SDK boundary.
+    assert payload.get("config") is None
+    parts = payload["contents"][0]["parts"]
+    assert parts[0] == {"text": "you are helpful"}
+    assert parts[1] == {"text": "extra system"}
     assert {"text": "user request"} in parts
     assert {"text": "retrieved context"} in parts
 

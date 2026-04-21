@@ -250,15 +250,21 @@ class GeminiAdapter:
     single user Content with text + fragments + text/image/PDF
     attachments and returns ``response.total_tokens``.
 
-    System prompt is prepended as a leading text Part rather than set
-    via ``GenerateContentConfig``; the payload shape is simpler, and
-    Gemini tokenises system and user text the same way, so the count
-    matches what ``generate_content`` would bill. Tools and tool
-    results are not included: the Gemini tool-calling format requires
-    a multi-turn message history whose invariants count_tokens
-    validates, and the over-count risk isn't worth the adapter
-    complexity. Callers that need exact counts for tool-heavy prompts
-    can extend this adapter.
+    System prompt is prepended as a leading user-role text part rather
+    than routed through ``CountTokensConfig.system_instruction``. The
+    latter would match billing more tightly (~5% closer), but the
+    ``count_tokens`` endpoint rejects ``system_instruction`` for some
+    Gemini models (e.g. ``gemini-flash-lite`` raises ``ValueError:
+    system_instruction parameter is not supported in Gemini API`` even
+    when the same model accepts it on ``generate_content``). Inlining
+    keeps the adapter model-agnostic at the cost of an envelope
+    over-count that errs in the safe direction for a gating tool.
+
+    Tools and tool results are not included: the Gemini tool-calling
+    format requires a multi-turn message history whose invariants
+    count_tokens validates, and the over-count risk isn't worth the
+    adapter complexity. Callers that need exact counts for tool-heavy
+    prompts can extend this adapter.
     """
 
     def matches(self, model: Any) -> bool:
@@ -281,14 +287,13 @@ class GeminiAdapter:
         client = genai.Client(api_key=api_key) if api_key else genai.Client()
 
         parts: list[dict] = []
-        system_parts: list[str] = []
+        # System prompt / fragments go first as leading text parts. See
+        # class docstring for why this isn't routed via CountTokensConfig.
         system = getattr(prompt, "system", None)
         if system:
-            system_parts.append(system)
+            parts.append({"text": system})
         for sf in getattr(prompt, "system_fragments", []) or []:
-            system_parts.append(str(sf))
-        if system_parts:
-            parts.append({"text": "\n".join(system_parts)})
+            parts.append({"text": str(sf)})
 
         body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
         if body:

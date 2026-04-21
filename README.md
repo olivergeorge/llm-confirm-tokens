@@ -137,6 +137,83 @@ flake, SDK too old), the plugin falls back to the heuristic and
 writes a one-line notice to stderr so you know silent degradation
 isn't happening.
 
+## Differences & assumptions per adapter
+
+Each provider's `count_tokens` surface has small quirks. The adapters
+all prioritise **working on every model in a provider's lineup** over
+matching billing to the nearest token. The shorthand is: an exact
+count is typically within ~5% of the real bill, always erring high.
+
+### Anthropic (`[anthropic]`)
+
+- **System prompt**: sent as the top-level `system` string
+  (Claude's own Messages API shape). Matches billing exactly.
+- **Attachments**: images become `{"type":"image", ...}`, PDFs become
+  `{"type":"document", ...}`. URL-only attachments are dropped rather
+  than fetched — the adapter makes exactly one HTTP call (the
+  `count_tokens` request itself) and no more.
+- **Tools**: included. Serialised as `{name, description, input_schema}`
+  exactly as Claude expects.
+- **Tool results from prior turns**: not included. Representing tool
+  use faithfully requires a specific alternating assistant/user message
+  history whose invariants `count_tokens` enforces, and
+  mis-structuring it would make the request fail rather than just
+  under-count. The local heuristic has already folded tool results
+  into its baseline, so the leftover under-count is minor in practice.
+
+### Gemini (`[gemini]`)
+
+- **System prompt**: inlined as leading user-role text parts, **not**
+  routed through `CountTokensConfig.system_instruction`. The
+  `count_tokens` endpoint rejects `system_instruction` for several
+  Gemini models (e.g. `gemini-flash-lite` raises `ValueError:
+  system_instruction parameter is not supported in Gemini API`),
+  even when the same model accepts it on `generate_content`.
+  Inlining keeps the adapter model-agnostic at the cost of ~5% of
+  envelope tokens that don't actually hit the bill.
+- **Attachments**: images and PDFs go in as `inline_data` parts with
+  base64-encoded content. URL-only attachments are dropped (no HEAD
+  or GET just to count).
+- **Tools and tool results**: not included. Gemini's tool format
+  requires a multi-turn message history whose invariants count_tokens
+  validates. The local heuristic already accounts for tools.
+- **Tokeniser parity**: Gemini tokenises text in `parts[]` the same
+  way as in `system_instruction`; the delta is envelope-only.
+
+### OpenAI (`[openai]`)
+
+- **Endpoint**: `/v1/responses/input_tokens`, i.e. the Responses-API
+  preflight counter. The Chat Completions and Responses APIs share
+  the same tokeniser, so this count is accurate even for `llm`
+  models that send their real prompt via chat completions.
+- **System prompt**: sent as the top-level `instructions` kwarg (what
+  the Responses API calls it).
+- **Attachments**: images become `input_image` with a base64 data URL;
+  PDFs become `input_file` with `filename` + `file_data`. URL-only
+  attachments are dropped.
+- **Tools and schemas**: not included in the current adapter. Tool
+  schemas materially change the counted total on OpenAI — this is a
+  known gap; the heuristic's JSON-serialised tool estimate is used
+  as a rough baseline until the adapter grows tool support.
+- **Minimum SDK**: `openai>=2.0` for the `responses.input_tokens`
+  resource. Older SDKs trigger the silent-fallback-plus-stderr-warning
+  path.
+
+### Shared assumptions
+
+- **URL-only attachments are never fetched** by any adapter. A
+  gating tool should not cause new outbound HTTP traffic to third
+  parties the user hasn't already consented to — the single
+  `count_tokens` request to their own provider is the one exception.
+- **Binary attachments we don't know how to handle** (audio, video,
+  bespoke file types) are dropped by the adapters. The heuristic
+  still counts them against its flat `_UNKNOWN_BINARY_TOKENS` budget,
+  so the estimate doesn't silently skip to zero.
+- **Adapter errors always fall back to the heuristic**, with a one-
+  line stderr notice naming the provider and the exception. Gating
+  is the feature; exact mode is a refinement. A broken refinement
+  must never break the feature.
+
 ## Using it as a Python library
 
 The gate is plain Python; you can instantiate it directly if you'd

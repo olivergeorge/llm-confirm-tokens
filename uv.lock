@@ -681,7 +681,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40" },
-    { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=0.3" },
+    { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=1.0" },
     { name = "llm", editable = "../llm" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.0" },
     { name = "tiktoken", marker = "extra == 'tiktoken'" },
