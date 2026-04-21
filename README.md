@@ -67,6 +67,7 @@ schemas — install the extra for your provider and set
 ```bash
 llm install 'llm-confirm-tokens[anthropic]'   # Claude models
 llm install 'llm-confirm-tokens[gemini]'      # Gemini models
+llm install 'llm-confirm-tokens[openai]'      # GPT / o-series models
 
 export LLM_CONFIRM_TOKENS=1
 export LLM_CONFIRM_TOKENS_EXACT=1
@@ -80,6 +81,7 @@ real request:
 | -------- | -------- | --- | ----- |
 | Anthropic | [`/v1/messages/count_tokens`](https://docs.anthropic.com/en/api/messages-count-tokens) | `anthropic` | `[anthropic]` |
 | Google Gemini | `Client.models.count_tokens` | `google-genai` | `[gemini]` |
+| OpenAI | `/v1/responses/input_tokens` | `openai>=2.0` | `[openai]` |
 
 One extra round-trip (~100–300 ms) per gated prompt, no billing.
 Anything that doesn't match — non-matching model, SDK missing, key
@@ -87,9 +89,10 @@ missing, network error — silently falls back to the local heuristic,
 so turning exact mode on never breaks gating.
 
 Keys are resolved first from the canonical env var
-(`ANTHROPIC_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`) and then
-from llm's own keyring, so no extra configuration is needed for
-users who already have `llm keys set` configured.
+(`ANTHROPIC_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`,
+`OPENAI_API_KEY`) and then from llm's own keyring, so no extra
+configuration is needed for users who already have `llm keys set`
+configured.
 
 URL-only attachments are deliberately not fetched (same as the
 heuristic) — the plugin never makes pre-flight HTTP calls of its own

@@ -37,6 +37,11 @@ anthropic = ["anthropic>=0.40"]
 # LLM_CONFIRM_TOKENS_EXACT=1.
 gemini = ["google-genai>=0.3"]
 
+# Exact pre-flight counts for OpenAI models via
+# client.responses.input_tokens.count. Requires a recent openai SDK
+# that exposes the responses.input_tokens resource.
+openai = ["openai>=2.0"]
+
 [project.entry-points.llm]
 llm_confirm_tokens = "llm_confirm_tokens"
 

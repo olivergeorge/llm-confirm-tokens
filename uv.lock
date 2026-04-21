@@ -663,6 +663,9 @@ anthropic = [
 gemini = [
     { name = "google-genai" },
 ]
+openai = [
+    { name = "openai" },
+]
 tiktoken = [
     { name = "tiktoken" },
 ]
@@ -680,9 +683,10 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=0.3" },
     { name = "llm", editable = "../llm" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=2.0" },
     { name = "tiktoken", marker = "extra == 'tiktoken'" },
 ]
-provides-extras = ["tiktoken", "anthropic", "gemini"]
+provides-extras = ["tiktoken", "anthropic", "gemini", "openai"]
 
 [package.metadata.requires-dev]
 dev = [
