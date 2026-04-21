@@ -28,6 +28,7 @@ from llm import hookimpl
 __all__ = [
     "ConfirmTokensGate",
     "count_prompt_tokens",
+    "estimate_tokens",
     "register_prompt_gates",
 ]
 
@@ -41,6 +42,11 @@ def _is_enabled() -> bool:
 
 def _assume_yes() -> bool:
     return os.environ.get("LLM_CONFIRM_TOKENS_YES", "").strip().lower() in _TRUTHY
+
+
+def _exact_mode() -> bool:
+    """Opt-in flag for using provider count APIs instead of local heuristics."""
+    return os.environ.get("LLM_CONFIRM_TOKENS_EXACT", "").strip().lower() in _TRUTHY
 
 
 def _threshold() -> int:
@@ -244,6 +250,30 @@ def count_prompt_tokens(prompt: llm.Prompt) -> int:
     return tokens
 
 
+def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
+    """Return a pre-flight token estimate for ``prompt``.
+
+    Tries opt-in provider-native counters first (when
+    ``LLM_CONFIRM_TOKENS_EXACT=1``, the matching SDK is installed, and
+    the model belongs to that provider) and falls back to the offline
+    heuristic for everything else. Adapter failures — missing key,
+    network error, model not recognised, SDK version drift — always
+    fall through silently so a gated prompt never fails closed on the
+    plugin's infrastructure.
+    """
+    if model is not None and _exact_mode():
+        from . import _adapters
+
+        for adapter in _adapters.iter_adapters():
+            if not adapter.matches(model):
+                continue
+            try:
+                return adapter.count(prompt, model)
+            except Exception:
+                break
+    return count_prompt_tokens(prompt)
+
+
 def _ask_via_tty(tokens: int) -> bool:
     """Prompt the user on ``/dev/tty`` and return True to proceed.
 
@@ -274,22 +304,32 @@ class ConfirmTokensGate:
     """Prompt gate that confirms with the user before large prompts are sent.
 
     Inject ``tokens_fn`` and ``ask`` for tests — in production the defaults
-    (tiktoken-based counting and ``/dev/tty`` prompting) are used.
+    (exact counts for providers that support them, heuristic otherwise, and
+    ``/dev/tty`` prompting) are used.
+
+    ``tokens_fn`` receives ``(prompt, model)``; legacy callers that pass a
+    single-argument function are still accepted.
     """
 
     def __init__(
         self,
         *,
         threshold: int = 0,
-        tokens_fn: Callable[[llm.Prompt], int] | None = None,
+        tokens_fn: Callable[..., int] | None = None,
         ask: Callable[[int], bool] | None = None,
     ) -> None:
         self.threshold = threshold
-        self._tokens_fn = tokens_fn or count_prompt_tokens
+        self._tokens_fn = tokens_fn or estimate_tokens
         self._ask = ask or _ask_via_tty
 
+    def _count(self, prompt: llm.Prompt, model: Any) -> int:
+        try:
+            return self._tokens_fn(prompt, model)
+        except TypeError:
+            return self._tokens_fn(prompt)
+
     def check(self, prompt: llm.Prompt, model: Any) -> None:
-        tokens = self._tokens_fn(prompt)
+        tokens = self._count(prompt, model)
         if tokens < self.threshold:
             return
         if _assume_yes():

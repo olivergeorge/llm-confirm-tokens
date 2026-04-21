@@ -56,9 +56,30 @@ network calls:
 Numbers won't match a specific provider's internal tokeniser exactly —
 different providers charge different per-image / per-page rates — but
 they are typically within 10–30 % of `llm -u`, which is the "did I just
-attach a 200-page PDF?" signal the plugin is meant to catch. If you
-need exact pre-flight counts, use the provider's own `countTokens`
-endpoint (Gemini) or `messages.count_tokens` (Anthropic).
+attach a 200-page PDF?" signal the plugin is meant to catch.
+
+## Exact counts for Claude (opt-in)
+
+If you want billing-grade accuracy for Claude models — including images,
+PDFs, and tool schemas — install the `anthropic` extra and set
+`LLM_CONFIRM_TOKENS_EXACT=1`:
+
+```bash
+llm install 'llm-confirm-tokens[anthropic]'
+export LLM_CONFIRM_TOKENS=1
+export LLM_CONFIRM_TOKENS_EXACT=1
+```
+
+When exact mode is on, a Claude model prompt is sent to Anthropic's
+free [`/v1/messages/count_tokens`](https://docs.anthropic.com/en/api/messages-count-tokens)
+endpoint before the real call. One extra round-trip (~100–300ms) per
+gated prompt, no billing. Anything that doesn't match — non-Claude
+models, SDK missing, key missing, network error — silently falls back
+to the local heuristic, so turning exact mode on never breaks gating.
+
+URL-only attachments are deliberately not fetched by the adapter (same
+as the heuristic) — the plugin never makes pre-flight HTTP calls of
+its own beyond the single `count_tokens` request.
 
 ## Enable
 
@@ -76,6 +97,7 @@ Options via environment variables:
 | `LLM_CONFIRM_TOKENS` | *unset* | Set to `1` / `true` / `yes` / `on` to register the gate. Unset or `0` means "plugin installed but inactive". |
 | `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number. `0` means confirm on every prompt. |
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
+| `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
 
 The confirmation is read from `/dev/tty`, so the plugin works correctly
 even when `stdin` is a piped file (`cat big.txt | llm …`). On systems
