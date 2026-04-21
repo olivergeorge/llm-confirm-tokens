@@ -3,7 +3,7 @@
 Registers a :class:`PromptGate` via the ``register_prompt_gates`` hookspec.
 When enabled (``LLM_CONFIRM_TOKENS=1``) the gate counts tokens on the
 resolved prompt and, if the total is at or above the configured threshold,
-prints ``Total tokens: N. Proceed? [Y/n]:`` to ``/dev/tty`` and waits for
+prints ``Estimated input tokens: N. Proceed? [Y/n]:`` to ``/dev/tty`` and waits for
 the user. Anything other than an empty response or ``y``/``yes`` raises
 :class:`llm.CancelPrompt`, aborting the prompt before the upstream API is
 called.
@@ -672,7 +672,7 @@ def _ask_via_tty(
     if high is None:
         high = low
     total = _format_total(low, high, source)
-    message = f"Total tokens: {total}. Proceed? [Y/n]: "
+    message = f"Estimated input tokens: {total}. Proceed? [Y/n]: "
 
     # Path 1: sys.stdin + sys.stderr when both are interactive. No special
     # file opens, no seek, and it Just Works in the majority of cases.

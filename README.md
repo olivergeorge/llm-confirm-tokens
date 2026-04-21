@@ -9,7 +9,7 @@ reaches the model, counts the tokens on the resolved request
 
 ```
 $ files-to-prompt llm_replay | llm "what colour is the wind?"
-Total tokens: 7,391. Proceed? [Y/n]:
+Estimated input tokens: 7,391. Proceed? [Y/n]:
 ```
 
 Anything other than a bare `Enter`, `y`, or `yes` raises
@@ -102,7 +102,7 @@ confirmation prompt shows the range directly so you can see the
 uncertainty at a glance:
 
 ```
-Total tokens: ~3,114–~12,384. Proceed? [Y/n]:
+Estimated input tokens: ~3,114–~12,384. Proceed? [Y/n]:
 ```
 
 Text-only prompts, parseable images, and tool schemas collapse to a
@@ -128,7 +128,7 @@ PDFs where Gemini's embedded-image billing exceeds even the high bound.
 Local estimates will drift from provider billing whenever a provider
 changes how it charges images, PDFs, tools, or system envelopes — and
 that happens without warning. The confirmation line prefixes heuristic
-counts with `~` (`Total tokens: ~1,032. Proceed?`) so you can see at a
+counts with `~` (`Estimated input tokens: ~1,032. Proceed?`) so you can see at a
 glance that this isn't a bill. Typical accuracy against `llm -u` is
 within 10–30 % when our formula matches the provider's current rule;
 expect larger gaps during pricing rollovers. For the "did I just
@@ -229,8 +229,8 @@ Heuristic estimates are prefixed with `~` and exact counts show the
 provider name, so you can tell at a glance which one you got:
 
 ```
-Total tokens: ~7,391. Proceed? [Y/n]:         # heuristic
-Total tokens: 7,412 (anthropic). Proceed? [Y/n]:   # exact
+Estimated input tokens: ~7,391. Proceed? [Y/n]:         # heuristic
+Estimated input tokens: 7,412 (anthropic). Proceed? [Y/n]:   # exact
 ```
 
 If exact mode is enabled but the adapter fails (missing key, network
