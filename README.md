@@ -84,11 +84,11 @@ The heuristic parses width and height straight from the image header
 (PNG, JPEG, GIF, WebP — no Pillow dependency) and applies the
 provider's own documented formula:
 
-| Model class | Rule |
-| ----------- | ---- |
-| Gemini (default) | ≤ 384×384 → 258 tokens; otherwise `tile = clamp(min(w,h)/1.5, 256, 768)` and each tile costs 258 |
-| Anthropic `claude-*` | Downscale so longest side ≤ 1568, then `round(w × h / 750)` |
-| OpenAI `gpt-*` / `o1`/`o3`/`o4` | Fit in 2048², scale shortest side to 768, `85 + 170 × ceil(w/512) × ceil(h/512)` (high-detail tiles) |
+| Model class | Rule | Source |
+| ----------- | ---- | ------ |
+| Gemini (default) | ≤ 384×384 → 258 tokens; otherwise `tile = clamp(min(w,h)/1.5, 256, 768)` and each tile costs 258 | [Gemini image understanding: image tokenization](https://ai.google.dev/gemini-api/docs/image-understanding) |
+| Anthropic `claude-*` | Downscale so longest side ≤ 1568, then `round(w × h / 750)` | [Claude vision: evaluating image size](https://platform.claude.com/docs/en/build-with-claude/vision#evaluate-image-size) |
+| OpenAI `gpt-*` / `o1`/`o3`/`o4` | Fit in 2048², scale shortest side to 768, `85 + 170 × ceil(w/512) × ceil(h/512)` (high-detail tiles) | [OpenAI vision: calculating costs](https://platform.openai.com/docs/guides/vision) |
 
 When we can't parse the image (exotic formats, corrupt bytes), each
 image falls back to a flat 258 tokens.
