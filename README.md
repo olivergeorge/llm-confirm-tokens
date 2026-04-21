@@ -116,11 +116,26 @@ Options via environment variables:
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
 | `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
 
-The confirmation is read from `/dev/tty`, so the plugin works correctly
-even when `stdin` is a piped file (`cat big.txt | llm …`). On systems
-without a `/dev/tty` (some CI sandboxes) the plugin prints the token
-count to stderr and proceeds — interactive scripts get the prompt,
-non-interactive scripts are not blocked.
+The confirmation is read from `/dev/tty` (POSIX) or `CONIN$` (Windows),
+so the plugin works correctly even when `stdin` is piped
+(`cat big.txt | llm …`). If no interactive terminal is available at
+all — typical in CI sandboxes — the plugin **fails closed**: it prints
+the token count to stderr and raises `CancelPrompt`. Scripts that
+want to run unattended with the plugin installed should set
+`LLM_CONFIRM_TOKENS_YES=1`.
+
+Heuristic estimates are prefixed with `~` and exact counts show the
+provider name, so you can tell at a glance which one you got:
+
+```
+Total tokens: ~7,391. Proceed? [Y/n]:         # heuristic
+Total tokens: 7,412 (anthropic). Proceed? [Y/n]:   # exact
+```
+
+If exact mode is enabled but the adapter fails (missing key, network
+flake, SDK too old), the plugin falls back to the heuristic and
+writes a one-line notice to stderr so you know silent degradation
+isn't happening.
 
 ## Using it as a Python library
 

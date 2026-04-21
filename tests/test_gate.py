@@ -228,6 +228,17 @@ def test_count_prompt_tokens_missing_file_uses_flat_estimate(tmp_path):
     assert count_prompt_tokens(prompt) > count_prompt_tokens(_FakePrompt("hi"))
 
 
+def test_counter_survives_strings_that_contain_special_tokens():
+    """Strings with ``<|endoftext|>`` etc must not crash count_prompt_tokens.
+
+    tiktoken raises ValueError by default on these strings; we pass
+    ``disallowed_special=()`` so user prompts that mention GPT internals
+    can still be counted. Regression guard for the Gemini review finding.
+    """
+    prompt = _FakePrompt("help me understand <|endoftext|> and <|im_start|>")
+    count_prompt_tokens(prompt)  # must not raise
+
+
 def test_count_prompt_tokens_includes_tools_and_schema():
     """Tool JSON schemas and structured-output schemas add to the estimate."""
 

@@ -29,6 +29,7 @@ __all__ = [
     "ConfirmTokensGate",
     "count_prompt_tokens",
     "estimate_tokens",
+    "estimate_tokens_detailed",
     "register_prompt_gates",
 ]
 
@@ -85,7 +86,11 @@ def _make_counter() -> Callable[[str], int]:
         import tiktoken
 
         enc = tiktoken.get_encoding("cl100k_base")
-        return lambda text: len(enc.encode(text))
+        # disallowed_special=() lets user strings containing tokens like
+        # ``<|endoftext|>`` pass through as literal bytes instead of
+        # raising ValueError — which would otherwise crash llm mid-prompt
+        # the moment anyone asks the model about GPT internals.
+        return lambda text: len(enc.encode(text, disallowed_special=()))
     except Exception:
 
         def _heuristic(text: str) -> int:
@@ -250,16 +255,17 @@ def count_prompt_tokens(prompt: llm.Prompt) -> int:
     return tokens
 
 
-def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
-    """Return a pre-flight token estimate for ``prompt``.
+def estimate_tokens_detailed(
+    prompt: llm.Prompt, model: Any = None
+) -> tuple[int, str]:
+    """Return ``(tokens, source)`` where source is ``"heuristic"`` or the
+    provider name when an exact-count adapter produced the figure.
 
-    Tries opt-in provider-native counters first (when
-    ``LLM_CONFIRM_TOKENS_EXACT=1``, the matching SDK is installed, and
-    the model belongs to that provider) and falls back to the offline
-    heuristic for everything else. Adapter failures — missing key,
-    network error, model not recognised, SDK version drift — always
-    fall through silently so a gated prompt never fails closed on the
-    plugin's infrastructure.
+    Adapter failures fall through to the local heuristic, but unlike the
+    v0 behaviour they are *not* silent: a one-line notice goes to stderr
+    so the user can see when exact mode is actually taking effect and
+    when it has silently degraded. Gating is a trust tool; invisible
+    fallback is how trust erodes.
     """
     if model is not None and _exact_mode():
         from . import _adapters
@@ -267,37 +273,69 @@ def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
         for adapter in _adapters.iter_adapters():
             if not adapter.matches(model):
                 continue
+            name = type(adapter).__name__.removesuffix("Adapter").lower() or "adapter"
             try:
-                return adapter.count(prompt, model)
-            except Exception:
+                return (adapter.count(prompt, model), name)
+            except Exception as exc:
+                sys.stderr.write(
+                    f"llm-confirm-tokens: {name} exact-count failed "
+                    f"({type(exc).__name__}: {exc}); using heuristic.\n"
+                )
                 break
-    return count_prompt_tokens(prompt)
+    return (count_prompt_tokens(prompt), "heuristic")
 
 
-def _ask_via_tty(tokens: int) -> bool:
-    """Prompt the user on ``/dev/tty`` and return True to proceed.
+def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
+    """Return a pre-flight token estimate for ``prompt``.
 
-    Falls back to stderr/stdin when ``/dev/tty`` is not available
-    (e.g. CI, sandboxed scripts). If no interactive input is possible
-    at all, returns True so non-interactive scripts are not blocked —
-    users who want strict blocking should gate their scripts on the
-    env var directly.
+    Thin wrapper over :func:`estimate_tokens_detailed` for callers that
+    only want the number. The gate uses the detailed form so it can
+    indicate in the confirmation prompt whether the figure is exact.
     """
-    message = f"Total tokens: {tokens:,}. Proceed? [Y/n]: "
-    try:
-        with open("/dev/tty", "r+") as tty:
-            tty.write(message)
-            tty.flush()
-            answer = tty.readline()
-    except OSError:
-        if not sys.stdin.isatty():
-            sys.stderr.write(f"llm-confirm-tokens: {tokens:,} tokens (no tty; proceeding)\n")
-            return True
-        sys.stderr.write(message)
-        sys.stderr.flush()
-        answer = sys.stdin.readline()
-    answer = (answer or "").strip().lower()
-    return answer in ("", "y", "yes")
+    return estimate_tokens_detailed(prompt, model)[0]
+
+
+def _tty_paths() -> tuple[str, ...]:
+    """Return the platform-specific paths to try for an interactive console.
+
+    POSIX gets ``/dev/tty`` as the canonical reliable path. Windows uses
+    the ``CONIN$`` magic device, which is the console input channel even
+    when stdin has been redirected to a pipe — exactly the case the gate
+    exists for (``files-to-prompt ... | llm "...")``.
+    """
+    if sys.platform == "win32":
+        return ("CONIN$",)
+    return ("/dev/tty",)
+
+
+def _ask_via_tty(tokens: int, source: str = "heuristic") -> bool:
+    """Prompt the user on the platform's tty and return True to proceed.
+
+    Fails **closed** when no interactive terminal is available — if the
+    plugin is enabled but the user can't be asked, declining the prompt
+    is safer than silently approving a large payload. Batch scripts that
+    want auto-approval should set ``LLM_CONFIRM_TOKENS_YES=1``, which
+    bypasses this function entirely.
+    """
+    prefix = "~" if source == "heuristic" else ""
+    suffix = "" if source == "heuristic" else f" ({source})"
+    message = f"Total tokens: {prefix}{tokens:,}{suffix}. Proceed? [Y/n]: "
+    for path in _tty_paths():
+        try:
+            with open(path, "r+") as tty:
+                tty.write(message)
+                tty.flush()
+                answer = tty.readline()
+        except OSError:
+            continue
+        return (answer or "").strip().lower() in ("", "y", "yes")
+    # No interactive terminal available — tell the user why we're declining.
+    sys.stderr.write(
+        f"llm-confirm-tokens: {prefix}{tokens:,} tokens, but no tty available "
+        "to confirm. Set LLM_CONFIRM_TOKENS_YES=1 to auto-approve in "
+        "non-interactive environments.\n"
+    )
+    return False
 
 
 class ConfirmTokensGate:
@@ -305,10 +343,13 @@ class ConfirmTokensGate:
 
     Inject ``tokens_fn`` and ``ask`` for tests — in production the defaults
     (exact counts for providers that support them, heuristic otherwise, and
-    ``/dev/tty`` prompting) are used.
+    platform-appropriate tty prompting) are used.
 
     ``tokens_fn`` receives ``(prompt, model)``; legacy callers that pass a
-    single-argument function are still accepted.
+    single-argument function are still accepted. ``ask`` receives
+    ``(tokens, source)`` where source is ``"heuristic"`` or the provider
+    adapter name; legacy single-argument ``ask`` callables are also
+    accepted so in-process test code doesn't have to change.
     """
 
     def __init__(
@@ -316,25 +357,46 @@ class ConfirmTokensGate:
         *,
         threshold: int = 0,
         tokens_fn: Callable[..., int] | None = None,
-        ask: Callable[[int], bool] | None = None,
+        ask: Callable[..., bool] | None = None,
     ) -> None:
         self.threshold = threshold
-        self._tokens_fn = tokens_fn or estimate_tokens
+        self._tokens_fn = tokens_fn
         self._ask = ask or _ask_via_tty
 
-    def _count(self, prompt: llm.Prompt, model: Any) -> int:
+    def _count(self, prompt: llm.Prompt, model: Any) -> tuple[int, str]:
+        """Return ``(tokens, source)``.
+
+        When no ``tokens_fn`` was injected, we call
+        :func:`estimate_tokens_detailed` directly so the true source
+        ("heuristic", "anthropic", "gemini", "openai") flows through
+        to the confirmation message. Injected counters that return
+        just an int (typical for tests) are labelled "heuristic" by
+        convention; injected counters can return a ``(tokens, source)``
+        tuple if they want to control the label.
+        """
+        if self._tokens_fn is None:
+            return estimate_tokens_detailed(prompt, model)
         try:
-            return self._tokens_fn(prompt, model)
+            result = self._tokens_fn(prompt, model)
         except TypeError:
-            return self._tokens_fn(prompt)
+            result = self._tokens_fn(prompt)
+        if isinstance(result, tuple):
+            return result  # type: ignore[return-value]
+        return (int(result), "heuristic")
+
+    def _invoke_ask(self, tokens: int, source: str) -> bool:
+        try:
+            return self._ask(tokens, source)
+        except TypeError:
+            return self._ask(tokens)
 
     def check(self, prompt: llm.Prompt, model: Any) -> None:
-        tokens = self._count(prompt, model)
+        tokens, source = self._count(prompt, model)
         if tokens < self.threshold:
             return
         if _assume_yes():
             return
-        if not self._ask(tokens):
+        if not self._invoke_ask(tokens, source):
             raise llm.CancelPrompt(f"user declined {tokens:,} token prompt")
 
 
