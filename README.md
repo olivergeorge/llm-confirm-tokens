@@ -36,6 +36,30 @@ it the plugin falls back to a `len(text) // 4` heuristic.
 llm install 'llm-confirm-tokens[tiktoken]'
 ```
 
+## What it counts
+
+The estimate covers the whole resolved prompt, locally and without any
+network calls:
+
+| Part | Estimation |
+| ---- | ---------- |
+| `prompt`, `system`, fragments | tiktoken (`cl100k_base`) or `len // 4` |
+| Text attachments (`text/*`, JSON, YAML, XML) | read from disk + tokenised |
+| Image attachments | 258 tokens each (matches Gemini's per-image cost) |
+| PDF attachments | `pages × 258`; page count inferred from the raw bytes |
+| Tool definitions | JSON-serialised and tokenised |
+| Prior tool results | `str(output)` tokenised |
+| Structured-output schema | JSON-serialised and tokenised |
+| URL-only attachments | flat 300 (never fetched) |
+| Unknown binary blobs | flat 300 |
+
+Numbers won't match a specific provider's internal tokeniser exactly —
+different providers charge different per-image / per-page rates — but
+they are typically within 10–30 % of `llm -u`, which is the "did I just
+attach a 200-page PDF?" signal the plugin is meant to catch. If you
+need exact pre-flight counts, use the provider's own `countTokens`
+endpoint (Gemini) or `messages.count_tokens` (Anthropic).
+
 ## Enable
 
 The plugin is **opt-in** so installing it does not change the behaviour

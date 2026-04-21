@@ -14,9 +14,12 @@ the behaviour of any existing script.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import llm
@@ -48,14 +51,45 @@ def _threshold() -> int:
         return 0
 
 
-def _prompt_text(prompt: llm.Prompt) -> str:
-    """Flatten the user-visible text payload of a prompt for token counting.
+# Per-media token constants, calibrated against Gemini 1.5/2.x documented
+# pricing (image and PDF pages both cost ~258 input tokens). These are
+# directional — different providers tokenise images differently (OpenAI
+# charges per tile, Anthropic per image region) — but 258 per image /
+# per PDF page is a defensible default for the "is this about to cost
+# me a lot?" question the plugin is trying to answer.
+_IMAGE_TOKENS = 258
+_PDF_TOKENS_PER_PAGE = 258
+_UNKNOWN_BINARY_TOKENS = 300
 
-    Binary attachments are out of scope — plugins that want a precise
-    image-token estimate can register their own gate. The heuristic here
-    is deliberately rough so the "proceed?" signal is directional rather
-    than authoritative.
+# PDF /Type /Page entries: accurate for uncompressed PDFs, an under-count
+# for PDFs whose object streams are compressed. The byte-size fallback in
+# ``_pdf_page_count`` papers over that common case.
+_PDF_PAGE_PATTERN = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
+
+
+def _make_counter() -> Callable[[str], int]:
+    """Return a ``text -> int`` token counter.
+
+    Uses tiktoken's ``cl100k_base`` encoding when available (accurate for
+    OpenAI and reasonable for most others); falls back to
+    ``max(1, len(text) // 4)`` when tiktoken isn't installed so the plugin
+    still works on any Python environment.
     """
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(enc.encode(text))
+    except Exception:
+
+        def _heuristic(text: str) -> int:
+            return max(1, len(text) // 4) if text else 0
+
+        return _heuristic
+
+
+def _prompt_text(prompt: llm.Prompt) -> str:
+    """Flatten the text portion of a prompt (system + body + fragments)."""
     parts: list[str] = []
     system = getattr(prompt, "system", None)
     if system:
@@ -70,22 +104,144 @@ def _prompt_text(prompt: llm.Prompt) -> str:
     return "\n".join(p for p in parts if p)
 
 
-def count_prompt_tokens(prompt: llm.Prompt) -> int:
-    """Return an estimated token count for ``prompt``.
+def _attachment_bytes(a: Any) -> bytes | None:
+    """Return bytes for an attachment without triggering a network fetch.
 
-    Uses tiktoken's ``cl100k_base`` encoding when available (accurate for
-    OpenAI models and a reasonable approximation for others); falls back
-    to ``max(1, len(text) // 4)`` when tiktoken is not installed so the
-    plugin still works on any Python environment.
+    URL-only attachments are intentionally not resolved: the cost estimate
+    is a pre-flight check, and fetching every URL just to count tokens
+    would add latency (and side effects — logs, rate limits) to every
+    prompt. Such attachments fall back to ``_BINARY_ATTACHMENT_TOKENS``.
     """
-    text = _prompt_text(prompt)
-    try:
-        import tiktoken
+    content = getattr(a, "content", None)
+    if content:
+        return content
+    path = getattr(a, "path", None)
+    if path:
+        try:
+            return Path(path).read_bytes()
+        except OSError:
+            return None
+    return None
 
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except Exception:
-        return max(1, len(text) // 4)
+
+def _detect_mime(a: Any, data: bytes | None) -> str:
+    """Best-effort MIME detection that never performs network I/O.
+
+    Prefers the attachment's declared ``.type`` (what the model itself will
+    see), then sniffs the path (llm ships puremagic), then sniffs the
+    bytes. URL-only attachments without a declared type return "".
+    """
+    declared = getattr(a, "type", None)
+    if declared:
+        return declared
+    path = getattr(a, "path", None)
+    if path:
+        try:
+            from llm.utils import mimetype_from_path
+
+            sniffed = mimetype_from_path(path)
+            if sniffed:
+                return sniffed
+        except Exception:
+            pass
+    if data:
+        try:
+            from llm.utils import mimetype_from_string
+
+            sniffed = mimetype_from_string(data)
+            if sniffed:
+                return sniffed
+        except Exception:
+            pass
+    return ""
+
+
+def _pdf_page_count(data: bytes) -> int:
+    """Estimate pages in a PDF without pulling in a PDF parser.
+
+    Counts ``/Type /Page`` markers in the raw bytes. Compressed PDFs hide
+    their page objects inside compressed streams, so the regex returns 0
+    on those — ``max`` with a bytes-per-page fallback (50KB/page, a
+    middle-of-the-road value for mixed content) keeps the estimate honest
+    on modern PDFs.
+    """
+    regex_count = len(_PDF_PAGE_PATTERN.findall(data))
+    byte_estimate = max(1, len(data) // 50_000)
+    return max(regex_count, byte_estimate)
+
+
+_TEXTY_MIMES = {"application/json", "application/xml", "application/x-yaml"}
+
+
+def _looks_like_text(decoded: str) -> bool:
+    """True if the decoded string is predominantly printable characters.
+
+    UTF-8 happily decodes binary payloads that happen to use low code
+    points (control chars, hex blobs), so a raw successful decode is not
+    proof of "text". The 5%-control-char cap lines up with how tools like
+    ``file(1)`` distinguish text from data.
+    """
+    if not decoded:
+        return True
+    control = sum(1 for c in decoded if ord(c) < 0x20 and c not in "\n\r\t")
+    return (control / len(decoded)) <= 0.05
+
+
+def _count_attachment_tokens(count: Callable[[str], int], a: Any) -> int:
+    data = _attachment_bytes(a)
+    mime = _detect_mime(a, data)
+    if mime.startswith("image/"):
+        return _IMAGE_TOKENS
+    if mime == "application/pdf":
+        if data is None:
+            return _PDF_TOKENS_PER_PAGE
+        return _pdf_page_count(data) * _PDF_TOKENS_PER_PAGE
+    if data is None:
+        return _UNKNOWN_BINARY_TOKENS
+    texty_by_mime = mime.startswith("text/") or mime in _TEXTY_MIMES
+    try:
+        decoded = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return _UNKNOWN_BINARY_TOKENS
+    if texty_by_mime or _looks_like_text(decoded):
+        return count(decoded)
+    return _UNKNOWN_BINARY_TOKENS
+
+
+def count_prompt_tokens(prompt: llm.Prompt) -> int:
+    """Estimate the full token cost of ``prompt`` before it is sent.
+
+    Covers the text body (system, user prompt, fragments), attachments
+    (text attachments decoded and tokenised; binary or URL-only
+    attachments charged a flat ``_BINARY_ATTACHMENT_TOKENS``), tool
+    schemas, tool results from prior turns, and any structured-output
+    JSON schema. The number is an estimate — provider-side tokenisers
+    disagree on edge cases — but it catches the common "I forgot I
+    attached a 4MB PDF" failure mode.
+    """
+    count = _make_counter()
+    tokens = count(_prompt_text(prompt))
+    for a in getattr(prompt, "attachments", []) or []:
+        tokens += _count_attachment_tokens(count, a)
+    tools = getattr(prompt, "tools", []) or []
+    if tools:
+        tools_payload = [
+            {
+                "name": getattr(t, "name", None),
+                "description": getattr(t, "description", None),
+                "input_schema": getattr(t, "input_schema", None),
+            }
+            for t in tools
+        ]
+        tokens += count(json.dumps(tools_payload, default=str))
+    for tr in getattr(prompt, "tool_results", []) or []:
+        out = getattr(tr, "output", None)
+        if out:
+            tokens += count(str(out))
+    schema = getattr(prompt, "schema", None)
+    if schema is not None:
+        tokens += count(json.dumps(schema, default=str))
+    return tokens
 
 
 def _ask_via_tty(tokens: int) -> bool:
