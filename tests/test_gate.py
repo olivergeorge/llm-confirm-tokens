@@ -296,8 +296,7 @@ def test_drift_warn_fires_when_heuristic_diverges(monkeypatch, capsys):
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
-    # Heuristic on bare "hi" is ~1 token; exact "1000" gives a huge drift.
-    _maybe_warn_drift(1000, _FakePrompt("hi"), model=None, provider="anthropic")
+    _maybe_warn_drift(actual=1000, heuristic=100, source="anthropic")
     err = capsys.readouterr().err
     assert "heuristic" in err and "anthropic" in err and "best guess" in err
 
@@ -307,7 +306,7 @@ def test_drift_warn_silent_when_unset(monkeypatch, capsys):
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.delenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", raising=False)
-    _maybe_warn_drift(1000, _FakePrompt("hi"), model=None, provider="anthropic")
+    _maybe_warn_drift(actual=1000, heuristic=100, source="anthropic")
     assert capsys.readouterr().err == ""
 
 
@@ -316,9 +315,67 @@ def test_drift_warn_silent_when_within_threshold(monkeypatch, capsys):
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "50")
-    # Heuristic for "hi" ≈ 1 token; exact=2 is 50% but abs delta is small;
-    # picking exact=1 (identical to heuristic) to assert the silent path.
-    _maybe_warn_drift(1, _FakePrompt("hi"), model=None, provider="anthropic")
+    _maybe_warn_drift(actual=100, heuristic=90, source="anthropic")
+    assert capsys.readouterr().err == ""
+
+
+def test_estimate_tokens_detailed_stashes_heuristic_on_prompt(monkeypatch):
+    """The public counter records the heuristic on the prompt for later compare."""
+    from llm_confirm_tokens import estimate_tokens_detailed
+
+    monkeypatch.delenv("LLM_CONFIRM_TOKENS_EXACT", raising=False)
+    prompt = _FakePrompt("hello there")
+    estimate_tokens_detailed(prompt, model=None)
+    assert getattr(prompt, "_confirm_tokens_heuristic", None) is not None
+
+
+def test_after_log_to_db_warns_on_post_response_drift(monkeypatch, capsys):
+    """Billed vs heuristic drift is reported via the after_log_to_db hook."""
+    from llm_confirm_tokens import after_log_to_db
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "25")
+    prompt = _FakePrompt("hello")
+    prompt._confirm_tokens_heuristic = 258  # pre-flight estimate
+    prompt._confirm_tokens_model_id = "gemini-flash-latest"
+
+    class _Response:
+        input_tokens = 1080  # what the provider actually billed
+
+    _Response.prompt = prompt  # type: ignore[attr-defined]
+    after_log_to_db(_Response(), db=None)
+    err = capsys.readouterr().err
+    assert "heuristic 258" in err and "under-counts" in err
+    assert "gemini-flash-latest billed" in err
+
+
+def test_after_log_to_db_silent_without_stash(monkeypatch, capsys):
+    """Without a pre-flight stash (gate didn't run), the hook is a no-op."""
+    from llm_confirm_tokens import after_log_to_db
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
+
+    class _Response:
+        input_tokens = 9999
+        prompt = _FakePrompt("hi")  # no stash attribute set
+
+    after_log_to_db(_Response(), db=None)
+    assert capsys.readouterr().err == ""
+
+
+def test_after_log_to_db_silent_when_threshold_unset(monkeypatch, capsys):
+    """Without the opt-in env var, the post-response path stays quiet."""
+    from llm_confirm_tokens import after_log_to_db
+
+    monkeypatch.delenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", raising=False)
+    prompt = _FakePrompt("hello")
+    prompt._confirm_tokens_heuristic = 10
+    prompt._confirm_tokens_model_id = "claude-3-5-sonnet"
+
+    class _Response:
+        input_tokens = 10000
+
+    _Response.prompt = prompt  # type: ignore[attr-defined]
+    after_log_to_db(_Response(), db=None)
     assert capsys.readouterr().err == ""
 
 

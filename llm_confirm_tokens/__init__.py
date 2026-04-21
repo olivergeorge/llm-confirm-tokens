@@ -422,6 +422,10 @@ def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
     return tokens
 
 
+_DRIFT_STASH_ATTR = "_confirm_tokens_heuristic"
+_DRIFT_MODEL_STASH_ATTR = "_confirm_tokens_model_id"
+
+
 def estimate_tokens_detailed(
     prompt: llm.Prompt, model: Any = None
 ) -> tuple[int, str]:
@@ -434,13 +438,16 @@ def estimate_tokens_detailed(
     when it has silently degraded. Gating is a trust tool; invisible
     fallback is how trust erodes.
 
-    When ``LLM_CONFIRM_TOKENS_DRIFT_WARN`` is set and exact mode succeeds,
-    the function compares the exact count to the heuristic and writes a
-    one-line warning to stderr if they diverge beyond that percentage.
-    The heuristic is calibrated against today's provider formulas; if a
-    provider changes how it charges images, PDFs, or tools, the
-    heuristic will drift silently until this warning surfaces it.
+    The heuristic is always computed and stashed on the prompt so the
+    ``after_log_to_db`` hook can compare it against the billed count
+    once the response arrives. That makes drift detection work even
+    in heuristic-only mode — which is the mode where it matters most,
+    because that's where users have no ground truth to sanity-check
+    against locally.
     """
+    heuristic = count_prompt_tokens(prompt, model)
+    _stash_heuristic(prompt, heuristic, model)
+
     if model is not None and _exact_mode():
         from . import _adapters
 
@@ -450,7 +457,7 @@ def estimate_tokens_detailed(
             name = type(adapter).__name__.removesuffix("Adapter").lower() or "adapter"
             try:
                 exact = adapter.count(prompt, model)
-                _maybe_warn_drift(exact, prompt, model, name)
+                _maybe_warn_drift(exact, heuristic, name)
                 return (exact, name)
             except Exception as exc:
                 sys.stderr.write(
@@ -458,7 +465,7 @@ def estimate_tokens_detailed(
                     f"({type(exc).__name__}: {exc}); using heuristic.\n"
                 )
                 break
-    return (count_prompt_tokens(prompt, model), "heuristic")
+    return (heuristic, "heuristic")
 
 
 def _drift_threshold_pct() -> float | None:
@@ -473,32 +480,39 @@ def _drift_threshold_pct() -> float | None:
     return value if value > 0 else None
 
 
-def _maybe_warn_drift(
-    exact: int, prompt: llm.Prompt, model: Any, provider: str
-) -> None:
-    """Warn to stderr if heuristic deviates from ``exact`` by ≥ threshold.
+def _stash_heuristic(prompt: llm.Prompt, heuristic: int, model: Any) -> None:
+    """Record the pre-flight heuristic on the prompt for after-response drift.
 
-    Provides a canary for silent drift: if a provider changes its image
-    tile formula or starts billing tools differently, users won't
-    discover it from the gate itself (which now reports an exact count)
-    — only the drift warning will flag that the heuristic needs
-    re-tuning. Opt-in via env var so the extra heuristic pass has no
-    effect in the default configuration.
+    Uses a dunder-ish attribute name to make it clear this isn't part of
+    llm's public Prompt contract. Wrapped in try/except so a frozen or
+    slotted Prompt subclass can't break gating.
+    """
+    try:
+        setattr(prompt, _DRIFT_STASH_ATTR, heuristic)
+        setattr(prompt, _DRIFT_MODEL_STASH_ATTR, getattr(model, "model_id", None))
+    except Exception:
+        pass
+
+
+def _maybe_warn_drift(actual: int, heuristic: int, source: str) -> None:
+    """Warn to stderr if heuristic deviates from ``actual`` by ≥ threshold.
+
+    ``source`` names the ground-truth channel — ``"gemini"`` /
+    ``"anthropic"`` / ``"openai"`` for the pre-flight exact-count path,
+    or ``"<model_id> billed"`` for the post-response path. The same
+    formatter is used from both sites so the warning reads the same way
+    regardless of when drift was detected.
     """
     threshold = _drift_threshold_pct()
-    if threshold is None or exact <= 0:
+    if threshold is None or actual <= 0:
         return
-    try:
-        heuristic = count_prompt_tokens(prompt, model)
-    except Exception:
-        return
-    delta_pct = abs(exact - heuristic) / exact * 100
+    delta_pct = abs(actual - heuristic) / actual * 100
     if delta_pct < threshold:
         return
-    direction = "under" if heuristic < exact else "over"
+    direction = "under" if heuristic < actual else "over"
     sys.stderr.write(
         f"llm-confirm-tokens: heuristic {heuristic:,} {direction}-counts "
-        f"vs {provider} {exact:,} by {delta_pct:.0f}% — local estimates "
+        f"vs {source} {actual:,} by {delta_pct:.0f}% — local estimates "
         f"are a best guess, not billing-grade.\n"
     )
 
@@ -650,3 +664,29 @@ def register_prompt_gates(register: Any) -> None:
     if not _is_enabled():
         return
     register(ConfirmTokensGate(threshold=_threshold()))
+
+
+@hookimpl
+def after_log_to_db(response: Any, db: Any) -> None:
+    """Compare the stashed heuristic against the billed token count.
+
+    Fires after the real response has been logged, so ``response.input_tokens``
+    is the authoritative bill. Only warns when the user has opted in via
+    ``LLM_CONFIRM_TOKENS_DRIFT_WARN`` *and* the gate actually ran (so a
+    heuristic was stashed). Critical for heuristic-only users: without
+    this, they'd never know their local formula is off for their model.
+    """
+    threshold = _drift_threshold_pct()
+    if threshold is None:
+        return
+    prompt = getattr(response, "prompt", None)
+    if prompt is None:
+        return
+    heuristic = getattr(prompt, _DRIFT_STASH_ATTR, None)
+    if heuristic is None:
+        return
+    actual = getattr(response, "input_tokens", None)
+    if actual is None or actual <= 0:
+        return
+    model_id = getattr(prompt, _DRIFT_MODEL_STASH_ATTR, None) or "model"
+    _maybe_warn_drift(int(actual), int(heuristic), f"{model_id} billed")

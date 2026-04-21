@@ -107,10 +107,26 @@ for cost accounting, use **exact mode** below.
 
 If you want to know when the heuristic is drifting on *your*
 workload, set `LLM_CONFIRM_TOKENS_DRIFT_WARN` to a percentage (e.g.
-`25`). When exact mode succeeds and the heuristic is off by at least
-that much for the provider you're using, a one-line notice goes to
-stderr — so you can re-check the numbers before trusting them in a
-heuristic-only shell.
+`25`). The plugin compares the pre-flight heuristic to the actual
+billed count from the response (`after_log_to_db` hook) and writes a
+one-line stderr notice when they disagree by at least that much:
+
+```
+llm-confirm-tokens: heuristic 258 under-counts vs gemini-flash-latest
+billed 1,080 by 76% — local estimates are a best guess, not billing-grade.
+```
+
+Detection works in **both modes**:
+
+- **Heuristic-only mode** — the primary value. You have no local
+  ground truth, so this is the only way to discover that the formula
+  doesn't match how your provider bills today. Uses the response's
+  `input_tokens` after the fact; no extra API calls.
+- **Exact mode** — acts as a sanity check on the adapter itself. If
+  the exact count and the heuristic diverge, either the heuristic is
+  stale or the adapter is sending a badly-shaped request. Either way,
+  the warning fires as soon as the gate runs, without waiting for the
+  response.
 
 ## Exact counts (opt-in)
 
@@ -169,7 +185,7 @@ Options via environment variables:
 | `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number. `0` means confirm on every prompt. |
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
 | `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
-| `LLM_CONFIRM_TOKENS_DRIFT_WARN` | *unset* | Percentage threshold for drift warnings. When exact mode succeeds and the heuristic differs from the exact count by at least this much, a one-line notice is written to stderr. Off by default to keep the gate quiet. |
+| `LLM_CONFIRM_TOKENS_DRIFT_WARN` | *unset* | Percentage threshold for drift warnings. Compares the pre-flight heuristic against the billed count (after the response completes) — and, when exact mode is on, also against the exact count (before the response is sent). Off by default to keep the gate quiet. |
 
 The confirmation is read from `/dev/tty` (POSIX) or `CONIN$` (Windows),
 so the plugin works correctly even when `stdin` is piped
