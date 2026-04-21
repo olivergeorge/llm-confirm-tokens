@@ -379,6 +379,58 @@ def test_after_log_to_db_silent_when_threshold_unset(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_count_prompt_tokens_pdf_regex_wins_over_byte_fallback():
+    """When the regex sees real pages, the byte-size fallback must not inflate.
+
+    Regression: a 24-page 7MB PDF previously estimated at 146 pages because
+    ``max(regex, bytes // 50_000)`` let the byte floor override an accurate
+    page count on content-rich files. The composition is now
+    ``regex or bytes``, so a readable PDF uses its true page count.
+    """
+
+    class _FakePdf:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "application/pdf"
+
+    # 5 Page markers in a 2MB PDF. Byte estimate would be 2_000_000 // 50_000
+    # = 40 pages; true count is 5. Pre-fix would have picked 40.
+    pdf_bytes = (
+        b"%PDF-1.4\n"
+        + (b"/Type /Page\n" * 5)
+        + b"\x00" * 2_000_000
+        + b"%%EOF"
+    )
+    prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
+    n = count_prompt_tokens(prompt)
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    # 5 pages * 258 tokens ≈ 1290. The old 40-page byte floor would give
+    # ~10 320; the band below locks out that regression.
+    assert 1000 < (n - bare) < 2000
+
+
+def test_count_prompt_tokens_pdf_byte_fallback_when_regex_blind():
+    """Compressed PDFs (regex finds nothing) still get a bytes-based estimate."""
+
+    class _FakePdf:
+        def __init__(self, content):
+            self.content = content
+            self.path = None
+            self.url = None
+            self.type = "application/pdf"
+
+    # No Page markers — simulates a PDF with object streams.
+    pdf_bytes = b"%PDF-1.4\n" + b"\x00" * 500_000 + b"%%EOF"
+    prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
+    n = count_prompt_tokens(prompt)
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    # 500_000 // 50_000 = 10 pages * 258 ≈ 2580. Must be non-zero since we
+    # know there's a PDF attached even if we couldn't read the page count.
+    assert 2000 < (n - bare) < 3500
+
+
 def test_count_prompt_tokens_pdf_attachment_scales_with_pages():
     """PDFs cost per page — a 10-page PDF must estimate ~10 * per-page tokens."""
 

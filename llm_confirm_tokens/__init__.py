@@ -172,15 +172,20 @@ def _detect_mime(a: Any, data: bytes | None) -> str:
 def _pdf_page_count(data: bytes) -> int:
     """Estimate pages in a PDF without pulling in a PDF parser.
 
-    Counts ``/Type /Page`` markers in the raw bytes. Compressed PDFs hide
-    their page objects inside compressed streams, so the regex returns 0
-    on those — ``max`` with a bytes-per-page fallback (50KB/page, a
-    middle-of-the-road value for mixed content) keeps the estimate honest
-    on modern PDFs.
+    Counts ``/Type /Page`` markers in the raw bytes — authoritative when
+    visible, since each real page object declares itself that way. The
+    regex returns 0 when the PDF packs its page objects into a
+    compressed ``/ObjStm`` (typical for modern producers like pdfTeX,
+    Word, LibreOffice), so we only use the 50KB-per-page byte estimate
+    as a blind fallback. Using ``max(regex, bytes)`` — as an earlier
+    version did — lets the byte heuristic over-ride an accurate regex
+    count on content-rich PDFs (a 7MB / 24-page PDF estimated at 146
+    pages), which is why the composition is ``regex or bytes``.
     """
     regex_count = len(_PDF_PAGE_PATTERN.findall(data))
-    byte_estimate = max(1, len(data) // 50_000)
-    return max(regex_count, byte_estimate)
+    if regex_count > 0:
+        return regex_count
+    return max(1, len(data) // 50_000)
 
 
 _TEXTY_MIMES = {"application/json", "application/xml", "application/x-yaml"}
