@@ -77,7 +77,8 @@ def test_gate_raises_cancelprompt_on_no():
         tokens_fn=lambda p: 12345,
         ask=lambda n: False,
     )
-    with pytest.raises(llm.CancelPrompt, match="12,345"):
+    # Heuristic path humanises 12 345 → "12k"; match that form.
+    with pytest.raises(llm.CancelPrompt, match="12k input tokens"):
         gate.check(_FakePrompt("hi"), model=None)
 
 

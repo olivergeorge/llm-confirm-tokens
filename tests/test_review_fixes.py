@@ -70,9 +70,10 @@ def test_no_tty_gate_raises_cancelprompt(monkeypatch):
         gate.check(_FakePrompt(), model=None)
 
 
-def test_ask_message_marks_heuristic_with_tilde(monkeypatch):
-    """Heuristic counts are displayed with a ``~`` prefix so the user
-    can tell an estimate from an exact provider count."""
+def test_ask_message_humanises_heuristic_with_estimate_label(monkeypatch):
+    """Heuristic counts show a rounded number and an ``(estimate)`` tag
+    so the user can tell an estimate from an exact provider count at a
+    glance without confusing false precision."""
     written: list[str] = []
 
     class _FakeTTY:
@@ -96,13 +97,15 @@ def test_ask_message_marks_heuristic_with_tilde(monkeypatch):
 
     monkeypatch.setattr("builtins.open", lambda *a, **k: _FakeTTY())
     _ask_via_tty(1234, source="heuristic")
-    assert any("~1,234" in w for w in written)
-    assert not any("(heuristic)" in w for w in written)
+    combined = "".join(written)
+    assert "1.2k input tokens (estimate)" in combined
+    # Heuristic path must not show the raw four-digit number.
+    assert "1,234" not in combined
 
 
-def test_ask_message_marks_exact_with_provider(monkeypatch):
-    """Exact counts get the provider name appended so the user sees
-    the gate is relying on the provider's tokeniser, not the heuristic."""
+def test_ask_message_keeps_exact_counts_precise(monkeypatch):
+    """Exact counts stay at full precision and carry the provider name,
+    so the user sees the gate is relying on the provider's tokeniser."""
     written: list[str] = []
 
     class _FakeTTY:
@@ -127,8 +130,8 @@ def test_ask_message_marks_exact_with_provider(monkeypatch):
     monkeypatch.setattr("builtins.open", lambda *a, **k: _FakeTTY())
     _ask_via_tty(1234, source="anthropic")
     combined = "".join(written)
-    assert "1,234 (anthropic)" in combined
-    assert "~" not in combined
+    assert "1,234 input tokens (anthropic)" in combined
+    assert "estimate" not in combined
 
 
 def test_adapter_failure_emits_stderr_warning(monkeypatch, capsys):
@@ -216,7 +219,8 @@ def test_ask_prefers_stdin_stderr_when_both_are_ttys(monkeypatch):
     monkeypatch.setattr("builtins.open", _fail_open)
 
     assert _ask_via_tty(500, source="heuristic") is True
-    assert any("~500" in w for w in writes)
+    combined = "".join(writes)
+    assert "500 input tokens (estimate)" in combined
 
 
 def test_ask_never_uses_readwrite_plus_mode(monkeypatch):

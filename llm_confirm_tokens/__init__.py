@@ -3,7 +3,7 @@
 Registers a :class:`PromptGate` via the ``register_prompt_gates`` hookspec.
 When enabled (``LLM_CONFIRM_TOKENS=1``) the gate counts tokens on the
 resolved prompt and, if the total is at or above the configured threshold,
-prints ``Estimated input tokens: N. Proceed? [Y/n]:`` to ``/dev/tty`` and waits for
+prints ``7.4k input tokens (estimate). Proceed? [Y/n]:`` to ``/dev/tty`` and waits for
 the user. Anything other than an empty response or ``y``/``yes`` raises
 :class:`llm.CancelPrompt`, aborting the prompt before the upstream API is
 called.
@@ -632,13 +632,51 @@ def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
     return high
 
 
+def _humanize_estimate(n: int) -> str:
+    """Round ``n`` to a scannable order-of-magnitude string.
+
+    Estimates shouldn't show billing-grade precision — "7.4k tokens" is
+    both easier to scan and more honest than "7,391" when the underlying
+    number carries ±20% heuristic error. Rules:
+    - < 100: exact (small numbers are already readable)
+    - 100–999: nearest 10
+    - 1,000–9,999: one-decimal k (e.g. "1.6k", "7.4k")
+    - 10,000–999,999: whole-number k (e.g. "12k", "258k")
+    - 1,000,000+: one-decimal M
+    """
+    if n < 100:
+        return str(n)
+    if n < 1000:
+        return f"{round(n, -1):,}"
+    if n < 10_000:
+        return f"{n / 1000:.1f}k"
+    if n < 1_000_000:
+        return f"{round(n / 1000):,}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
 def _format_total(low: int, high: int, source: str) -> str:
-    """Format ``{prefix}low-high`` or ``{prefix}N`` for the prompt message."""
-    prefix = "~" if source == "heuristic" else ""
-    suffix = "" if source == "heuristic" else f" ({source})"
-    if low == high:
-        return f"{prefix}{high:,}{suffix}"
-    return f"{prefix}{low:,}–{prefix}{high:,}{suffix}"
+    """Format the number(s) and source tag for the confirmation prompt.
+
+    Layout is always ``{number-or-range} input tokens ({source})`` — the
+    number-of-tokens is first (fastest to scan), the unit makes the count
+    self-labelling, and the source in parens names where the count came
+    from ("estimate" for the local heuristic; provider name for exact
+    counts). Heuristic numbers are humanised (``7.4k``) because the
+    underlying value is already fuzzy; exact counts stay at full
+    precision because they're what the provider will actually bill.
+    """
+    if source == "heuristic":
+        label = "estimate"
+        number = (
+            _humanize_estimate(high)
+            if low == high
+            else f"{_humanize_estimate(low)}–{_humanize_estimate(high)}"
+        )
+    else:
+        label = source
+        number = f"{high:,}" if low == high else f"{low:,}–{high:,}"
+    return f"{number} input tokens ({label})"
 
 
 def _ask_via_tty(
@@ -672,7 +710,7 @@ def _ask_via_tty(
     if high is None:
         high = low
     total = _format_total(low, high, source)
-    message = f"Estimated input tokens: {total}. Proceed? [Y/n]: "
+    message = f"{total}. Proceed? [Y/n]: "
 
     # Path 1: sys.stdin + sys.stderr when both are interactive. No special
     # file opens, no seek, and it Just Works in the majority of cases.
@@ -711,7 +749,7 @@ def _ask_via_tty(
     # No interactive terminal available anywhere — tell the user why we're
     # declining so they can fix the environment or set YES=1 explicitly.
     sys.stderr.write(
-        f"llm-confirm-tokens: {total} tokens, but no tty available "
+        f"llm-confirm-tokens: {total}, but no tty available "
         "to confirm. Set LLM_CONFIRM_TOKENS_YES=1 to auto-approve in "
         "non-interactive environments.\n"
     )
@@ -779,7 +817,7 @@ class ConfirmTokensGate:
             return
         if not self._invoke_ask(low, high, source):
             total = _format_total(low, high, source)
-            raise llm.CancelPrompt(f"user declined {total} token prompt")
+            raise llm.CancelPrompt(f"user declined {total}")
 
 
 def _normalise_tokens_result(result: Any) -> tuple[int, int, str]:
