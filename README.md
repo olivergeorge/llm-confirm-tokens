@@ -18,16 +18,41 @@ conversation is not updated, and the CLI exits non-zero.
 
 ## Requirements
 
-This plugin depends on the `register_prompt_gates` hookspec. It is
-currently available on the `llm-prompt-gates-hook` branch of
-[olivergeorge/llm](https://github.com/olivergeorge/llm) pending upstream
-merge.
+This plugin depends on the `register_prompt_gates` hookspec, which is
+**not yet in upstream `llm`**.
+
+`register_prompt_gates` lets a plugin register a gate that runs on the
+resolved prompt *immediately before* `Model.execute(...)` is called,
+and raise `llm.CancelPrompt` to abort the request before any tokens
+leave the machine. That's the whole feature — without the hookspec
+there is nowhere in `llm`'s surface to intercept a prompt at that
+point, and the plugin would have to monkey-patch `_BaseResponse` or
+subclass every `Model` (fragile across `llm` versions, hostile to
+other plugins).
+
+The hookspec lives on the `llm-prompt-gates-hook` branch of
+[olivergeorge/llm](https://github.com/olivergeorge/llm) (also merged
+into `llm-replay-combined` alongside the replay hookspecs) pending
+upstream merge.
 
 ## Install
 
+Install the fork of `llm` that carries the hookspec, then install the
+plugin against it:
+
 ```bash
+# Clone and install the fork on the branch with the hookspec
+git clone -b llm-prompt-gates-hook https://github.com/olivergeorge/llm.git
+llm install -e ./llm
+
+# Install the plugin
 llm install llm-confirm-tokens
 ```
+
+If you already have a local checkout of `../llm`, `pyproject.toml`
+points at it as an editable dependency — just check out the
+`llm-prompt-gates-hook` (or `llm-replay-combined`) branch there and
+run `uv sync` / `pip install -e .`.
 
 Accurate token counting uses `tiktoken`'s `cl100k_base` encoding; without
 it the plugin falls back to a `len(text) // 4` heuristic.
