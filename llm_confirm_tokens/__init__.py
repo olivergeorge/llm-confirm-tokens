@@ -65,10 +65,37 @@ def _threshold() -> int:
 # of the three providers' per-image baselines. When we *can* read
 # dimensions (see ``_image_dimensions``) we apply the provider-specific
 # formula in ``_image_tokens_for_provider`` instead; the flat number is
-# only the last-resort path. PDF pages still use 258 as Gemini does.
+# only the last-resort path.
 _IMAGE_TOKENS = 258
-_PDF_TOKENS_PER_PAGE = 258
 _UNKNOWN_BINARY_TOKENS = 300
+
+# PDF per-page token estimates, calibrated against each provider's
+# observed or documented behaviour. PDFs are rendered/processed
+# differently by each vendor, so a single constant systematically
+# under-counts on some and over-counts on others:
+#
+# - Gemini renders each page as an image and runs it through the tile
+#   formula. Google's docs claim "258/page" but empirically letter-sized
+#   content pages hit ~2 tiles (≈516/page). A sample 12-page mixed-
+#   content PDF billed at 6,384 tokens (~532/page) — 516 lands within
+#   ~3% of that without over-counting small slide-size PDFs.
+# - Anthropic extracts text and embedded images. The Claude docs cite
+#   "1,500 to 3,000 tokens per page"; we use the conservative lower
+#   bound so the heuristic errs toward under-count rather than nagging
+#   on every PDF prompt. Exact mode is the right tool when a user
+#   cares about billing-grade accuracy.
+# - OpenAI handles PDFs via input_file on the Responses API, tiling
+#   each page similarly to how Gemini does. ~500/page is a rough
+#   parallel to Gemini at high-detail letter size.
+_PDF_TOKENS_PER_PAGE = {
+    "gemini": 516,
+    "anthropic": 1500,
+    "openai": 500,
+}
+
+
+def _pdf_tokens_per_page(provider: str) -> int:
+    return _PDF_TOKENS_PER_PAGE.get(provider, _PDF_TOKENS_PER_PAGE["gemini"])
 
 # PDF /Type /Page entries: accurate for uncompressed PDFs, an under-count
 # for PDFs whose object streams are compressed. The byte-size fallback in
@@ -370,9 +397,10 @@ def _count_attachment_tokens(
                 return _image_tokens_for_provider(provider, *dims)
         return _IMAGE_TOKENS
     if mime == "application/pdf":
+        per_page = _pdf_tokens_per_page(provider)
         if data is None:
-            return _PDF_TOKENS_PER_PAGE
-        return _pdf_page_count(data) * _PDF_TOKENS_PER_PAGE
+            return per_page
+        return _pdf_page_count(data) * per_page
     if data is None:
         return _UNKNOWN_BINARY_TOKENS
     texty_by_mime = mime.startswith("text/") or mime in _TEXTY_MIMES

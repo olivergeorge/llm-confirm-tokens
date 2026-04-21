@@ -71,7 +71,7 @@ network calls:
 | `prompt`, `system`, fragments | tiktoken (`cl100k_base`) or `len // 4` |
 | Text attachments (`text/*`, JSON, YAML, XML) | read from disk + tokenised |
 | Image attachments | provider-aware formula from parsed width/height — see below |
-| PDF attachments | `pages × 258`; page count inferred from the raw bytes |
+| PDF attachments | `pages × per-page-rate`; page count from `/Type /Page` markers (bytes fallback only for compressed PDFs) and per-page rate picked by provider — see below |
 | Tool definitions | JSON-serialised and tokenised |
 | Prior tool results | `str(output)` tokenised |
 | Structured-output schema | JSON-serialised and tokenised |
@@ -92,6 +92,19 @@ provider's own documented formula:
 
 When we can't parse the image (exotic formats, corrupt bytes), each
 image falls back to a flat 258 tokens.
+
+### PDF per-page rate by provider
+
+Each provider processes PDFs differently, so the per-page cost differs
+significantly. The page count itself comes from counting `/Type /Page`
+markers in the PDF stream; the bytes-per-page fallback is only used
+when the PDF is compressed into an object stream and the regex returns 0.
+
+| Model class | Per-page |
+| ----------- | -------- |
+| Gemini (default) | ~516 (each page renders as an image and usually tiles into two) |
+| Anthropic `claude-*` | ~1,500 (lower bound of Anthropic's documented 1,500–3,000 per page) |
+| OpenAI `gpt-*` / `o1`/`o3`/`o4` | ~500 (similar to Gemini's high-detail tile cost) |
 
 ### These are a best guess, not billing-grade
 
