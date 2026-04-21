@@ -1,0 +1,93 @@
+# llm-confirm-tokens
+
+Interactive "you are about to send N tokens, proceed?" gate for the
+[`llm`](https://llm.datasette.io) CLI.
+
+When enabled, the plugin intercepts each prompt immediately before it
+reaches the model, counts the tokens on the resolved request
+(system + fragments + prompt), and asks for confirmation on `/dev/tty`:
+
+```
+$ files-to-prompt llm_replay | llm "what colour is the wind?"
+Total tokens: 7,391. Proceed? [Y/n]:
+```
+
+Anything other than a bare `Enter`, `y`, or `yes` raises
+`llm.CancelPrompt` — the upstream API is **not** called, the
+conversation is not updated, and the CLI exits non-zero.
+
+## Requirements
+
+This plugin depends on the `register_prompt_gates` hookspec. It is
+currently available on the `llm-prompt-gates-hook` branch of
+[olivergeorge/llm](https://github.com/olivergeorge/llm) pending upstream
+merge.
+
+## Install
+
+```bash
+llm install llm-confirm-tokens
+```
+
+Accurate token counting uses `tiktoken`'s `cl100k_base` encoding; without
+it the plugin falls back to a `len(text) // 4` heuristic.
+
+```bash
+llm install 'llm-confirm-tokens[tiktoken]'
+```
+
+## Enable
+
+The plugin is **opt-in** so installing it does not change the behaviour
+of existing scripts. Enable per shell session:
+
+```bash
+export LLM_CONFIRM_TOKENS=1
+```
+
+Options via environment variables:
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `LLM_CONFIRM_TOKENS` | *unset* | Set to `1` / `true` / `yes` / `on` to register the gate. Unset or `0` means "plugin installed but inactive". |
+| `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number. `0` means confirm on every prompt. |
+| `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
+
+The confirmation is read from `/dev/tty`, so the plugin works correctly
+even when `stdin` is a piped file (`cat big.txt | llm …`). On systems
+without a `/dev/tty` (some CI sandboxes) the plugin prints the token
+count to stderr and proceeds — interactive scripts get the prompt,
+non-interactive scripts are not blocked.
+
+## Using it as a Python library
+
+The gate is plain Python; you can instantiate it directly if you'd
+rather not gate on env vars:
+
+```python
+import llm
+from llm_confirm_tokens import ConfirmTokensGate
+
+my_gate = ConfirmTokensGate(
+    threshold=1000,
+    tokens_fn=lambda prompt: my_counter(prompt),
+    ask=lambda n: click.confirm(f"{n} tokens, proceed?"),
+)
+
+@llm.hookimpl
+def register_prompt_gates(register):
+    register(my_gate)
+```
+
+`check(prompt, model)` is the entry point used by `llm`; raise
+`llm.CancelPrompt` from any custom `ask` to cancel.
+
+## Development
+
+```bash
+uv sync --dev
+uv run pytest
+```
+
+The repo depends on an editable `../llm` checkout for the hookspec; see
+`pyproject.toml`'s `[tool.uv.sources]` if your layout differs.

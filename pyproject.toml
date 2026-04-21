@@ -1,0 +1,66 @@
+[project]
+name = "llm-confirm-tokens"
+version = "0.1a0"
+description = "Interactive 'about to send N tokens, proceed?' gate for the llm CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    { name = "Oliver George" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+dependencies = [
+    "llm",
+]
+
+[project.optional-dependencies]
+# Accurate token counting for OpenAI-family models. Without it the plugin
+# falls back to a rough len(text)//4 heuristic.
+tiktoken = ["tiktoken"]
+
+[project.entry-points.llm]
+llm_confirm_tokens = "llm_confirm_tokens"
+
+[project.urls]
+Issues = "https://github.com/olivergeorge/llm-confirm-tokens/issues"
+
+[tool.uv.sources]
+llm = { path = "../llm", editable = true }
+
+[dependency-groups]
+dev = [
+    "llm-echo>=0.4",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "UP",
+    "B",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
