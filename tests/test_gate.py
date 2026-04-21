@@ -292,8 +292,8 @@ def test_image_jpeg_dimensions_parse():
     assert 900 <= (n - bare) <= 1100
 
 
-def test_drift_warn_fires_when_actual_outside_range(monkeypatch, capsys):
-    """LLM_CONFIRM_TOKENS_DRIFT_WARN logs a notice when actual exits [low, high]."""
+def test_drift_warn_fires_when_actual_exceeds_high(monkeypatch, capsys):
+    """Bill-shock case: actual exceeds the heuristic's upper bound → warn."""
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
@@ -312,6 +312,21 @@ def test_drift_warn_silent_when_actual_within_range(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_drift_warn_silent_when_actual_under_estimate(monkeypatch, capsys):
+    """Over-counts (actual < low) are 'pleasantly surprised' — no warning.
+
+    The user explicitly framed the drift signal as bill-shock prevention:
+    noisy "your estimate was generous" warnings are worse than useless.
+    """
+    from llm_confirm_tokens import _maybe_warn_drift
+
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "10")
+    # actual=500 is well below the estimate range 1000-2000 — 50% under,
+    # far outside the threshold, but we should still stay silent.
+    _maybe_warn_drift(actual=500, low=1000, high=2000, source="anthropic")
+    assert capsys.readouterr().err == ""
+
+
 def test_drift_warn_silent_when_unset(monkeypatch, capsys):
     """With the env var unset, drift comparison is silent (opt-in only)."""
     from llm_confirm_tokens import _maybe_warn_drift
@@ -321,13 +336,13 @@ def test_drift_warn_silent_when_unset(monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_drift_warn_silent_when_near_bound_within_threshold(monkeypatch, capsys):
-    """Actual just outside the band but within the percentage band stays silent."""
+def test_drift_warn_silent_when_near_high_within_threshold(monkeypatch, capsys):
+    """Actual just above high but within the percentage band stays silent."""
     from llm_confirm_tokens import _maybe_warn_drift
 
     monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRIFT_WARN", "50")
-    # actual=190 is below low=200, but only 5% under — well below 50% threshold.
-    _maybe_warn_drift(actual=190, low=200, high=300, source="anthropic")
+    # actual=310 is above high=300, but only ~3% over — below 50% threshold.
+    _maybe_warn_drift(actual=310, low=200, high=300, source="anthropic")
     assert capsys.readouterr().err == ""
 
 

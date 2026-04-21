@@ -143,7 +143,9 @@ If you want to know when the heuristic is drifting on *your*
 workload, set `LLM_CONFIRM_TOKENS_DRIFT_WARN` to a percentage (e.g.
 `25`). The plugin compares the pre-flight heuristic to the actual
 billed count from the response (`after_log_to_db` hook) and writes a
-one-line stderr notice when they disagree by at least that much:
+one-line stderr notice — but **only when the estimate under-counted
+reality**, since that's the case that risks bill shock. Over-counts
+(the "pleasantly surprised" case) stay silent.
 
 ```
 llm-confirm-tokens: heuristic 258 under-counts vs gemini-flash-latest

@@ -591,31 +591,30 @@ def _stash_heuristic(
 def _maybe_warn_drift(
     actual: int, low: int, high: int, source: str
 ) -> None:
-    """Warn to stderr when ``actual`` falls outside the heuristic range.
+    """Warn to stderr only when the heuristic ``under``-counted by ≥ threshold.
 
-    The heuristic expresses a band of plausible costs; drift only
-    matters when reality leaves that band. When it does, we report the
-    percentage gap to the nearest bound — which is the "how wrong were
-    we at best?" figure, not a worst-case comparison. ``source`` names
-    the ground-truth channel (``"gemini"`` / ``"anthropic"`` /
-    ``"openai"`` for the pre-flight exact-count path, or
-    ``"<model_id> billed"`` for the post-response path).
+    Bill shock is the failure mode we care about: a prompt the user
+    thought was cheap turning out to be expensive. Over-counts (estimate
+    exceeded reality) are the "pleasantly surprised" case — not worth
+    interrupting with a stderr warning. So this fires only when
+    ``actual`` exceeds the estimated upper bound by the configured
+    percentage. ``source`` names the ground-truth channel
+    (``"gemini"`` / ``"anthropic"`` / ``"openai"`` for the pre-flight
+    exact-count path, or ``"<model_id> billed"`` for the post-response
+    path).
     """
     threshold = _drift_threshold_pct()
     if threshold is None or actual <= 0:
         return
-    if low <= actual <= high:
+    # Actual inside the range or below it → no bill-shock risk, stay quiet.
+    if actual <= high:
         return
-    if actual < low:
-        near, direction = low, "over"
-    else:
-        near, direction = high, "under"
-    delta_pct = abs(actual - near) / actual * 100
+    delta_pct = (actual - high) / actual * 100
     if delta_pct < threshold:
         return
-    heuristic_str = f"{low:,}" if low == high else f"{low:,}–{high:,}"
+    heuristic_str = f"{high:,}" if low == high else f"{low:,}–{high:,}"
     sys.stderr.write(
-        f"llm-confirm-tokens: heuristic {heuristic_str} {direction}-counts "
+        f"llm-confirm-tokens: heuristic {heuristic_str} under-counts "
         f"vs {source} {actual:,} by {delta_pct:.0f}% — local estimates "
         f"are a best guess, not billing-grade.\n"
     )
