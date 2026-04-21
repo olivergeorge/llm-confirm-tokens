@@ -406,10 +406,10 @@ def test_count_prompt_tokens_pdf_regex_wins_over_byte_fallback():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 5 pages * 516 (Gemini default) ≈ 2580. Old 40-page byte floor would
-    # have given ~20 640; the band below locks out that regression while
-    # tolerating a small drift in the per-page constant.
-    assert 2000 < (n - bare) < 3500
+    # 5 pages * 258 (Gemini documented rate) = 1290. Old 40-page byte
+    # floor would have given ~10 320; the band below locks out that
+    # regression while tolerating a small drift in the per-page constant.
+    assert 1000 < (n - bare) < 1600
 
 
 def test_count_prompt_tokens_pdf_byte_fallback_when_regex_blind():
@@ -427,9 +427,10 @@ def test_count_prompt_tokens_pdf_byte_fallback_when_regex_blind():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 500_000 // 50_000 = 10 pages * 516 (Gemini) ≈ 5160. Must be non-zero
-    # since we know there's a PDF attached even if we couldn't parse it.
-    assert 4500 < (n - bare) < 5800
+    # 500_000 // 50_000 = 10 pages * 258 (Gemini documented) = 2580.
+    # Must be non-zero since we know there's a PDF attached even if we
+    # couldn't parse it.
+    assert 2300 < (n - bare) < 2900
 
 
 def test_count_prompt_tokens_pdf_attachment_scales_with_pages():
@@ -447,12 +448,12 @@ def test_count_prompt_tokens_pdf_attachment_scales_with_pages():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt)
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 10 pages * 516 (Gemini default) ≈ 5160.
-    assert 4500 < (n - bare) < 5800
+    # 10 pages * 258 (Gemini documented rate) = 2580.
+    assert 2300 < (n - bare) < 2900
 
 
 def test_count_prompt_tokens_pdf_anthropic_uses_higher_rate():
-    """Claude charges ~1500 tokens/page — much higher than Gemini's render-tile cost."""
+    """Claude charges ~2250 tokens/page — much higher than Gemini's flat rate."""
 
     class _FakePdf:
         def __init__(self, content):
@@ -465,8 +466,9 @@ def test_count_prompt_tokens_pdf_anthropic_uses_higher_rate():
     prompt = _FakePrompt("hi", attachments=[_FakePdf(pdf_bytes)])
     n = count_prompt_tokens(prompt, _ModelStub("claude-3-5-sonnet"))
     bare = count_prompt_tokens(_FakePrompt("hi"))
-    # 10 pages * 1500 = 15 000 per Anthropic's lower-bound docs.
-    assert 14_000 < (n - bare) < 16_500
+    # 10 pages * 2250 = 22 500 — midpoint of Anthropic's documented
+    # 1,500–3,000 text-tokens-per-page range.
+    assert 21_000 < (n - bare) < 24_000
 
 
 def test_count_prompt_tokens_pdf_openai_uses_tile_rate():

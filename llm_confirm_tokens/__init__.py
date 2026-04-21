@@ -69,27 +69,31 @@ def _threshold() -> int:
 _IMAGE_TOKENS = 258
 _UNKNOWN_BINARY_TOKENS = 300
 
-# PDF per-page token estimates, calibrated against each provider's
-# observed or documented behaviour. PDFs are rendered/processed
-# differently by each vendor, so a single constant systematically
-# under-counts on some and over-counts on others:
+# PDF per-page token estimates. Where the provider documents a
+# specific number we use it verbatim; where they don't, we infer.
+# Drift between the documented figure and real billing is the exact
+# signal LLM_CONFIRM_TOKENS_DRIFT_WARN is designed to surface.
 #
-# - Gemini renders each page as an image and runs it through the tile
-#   formula. Google's docs claim "258/page" but empirically letter-sized
-#   content pages hit ~2 tiles (≈516/page). A sample 12-page mixed-
-#   content PDF billed at 6,384 tokens (~532/page) — 516 lands within
-#   ~3% of that without over-counting small slide-size PDFs.
-# - Anthropic extracts text and embedded images. The Claude docs cite
-#   "1,500 to 3,000 tokens per page"; we use the conservative lower
-#   bound so the heuristic errs toward under-count rather than nagging
-#   on every PDF prompt. Exact mode is the right tool when a user
-#   cares about billing-grade accuracy.
-# - OpenAI handles PDFs via input_file on the Responses API, tiling
-#   each page similarly to how Gemini does. ~500/page is a rough
-#   parallel to Gemini at high-detail letter size.
+# - Gemini: 258 tokens per page per
+#   https://ai.google.dev/gemini-api/docs/document-processing
+#   ("each document page equals 258 tokens"). Real-world mixed-content
+#   PDFs on flash-lite have been observed at ~530/page, so the
+#   heuristic will flag them via drift — that's the intended design.
+# - Anthropic: midpoint of the documented 1,500–3,000 text-tokens-
+#   per-page range at
+#   https://platform.claude.com/docs/en/docs/build-with-claude/pdf-support
+#   ("Each page typically uses 1,500-3,000 tokens per page depending
+#   on content density"). Image tokens are charged separately by
+#   Anthropic (image formula on rendered page), but the render
+#   resolution isn't documented, so we don't try to model it — the
+#   drift warning catches the delta when it matters.
+# - OpenAI: no explicit per-page figure in the file-inputs docs at
+#   https://platform.openai.com/docs/guides/pdf-files. Keep the
+#   inferred ~500/page (aligns with high-detail tile cost for a
+#   letter-sized rendered page via OpenAI's standard image formula).
 _PDF_TOKENS_PER_PAGE = {
-    "gemini": 516,
-    "anthropic": 1500,
+    "gemini": 258,
+    "anthropic": 2250,
     "openai": 500,
 }
 
