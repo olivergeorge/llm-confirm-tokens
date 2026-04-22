@@ -169,6 +169,44 @@ def _prompt_text(prompt: llm.Prompt) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _prompt_user_text(prompt: llm.Prompt) -> str:
+    """Flatten a prompt's user text only — body + fragments, no system.
+
+    Prior turns in a conversation re-send the system prompt exactly once
+    (via the current turn); counting it on each historical turn would
+    triple-count it on a three-turn chat. The user-side body is what the
+    provider actually re-serialises turn-by-turn, so that's what we count.
+    """
+    parts: list[str] = []
+    body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
+    if body:
+        parts.append(body)
+    for f in getattr(prompt, "fragments", []) or []:
+        parts.append(str(f))
+    return "\n".join(p for p in parts if p)
+
+
+def _response_output_text(response: Any) -> str:
+    """Return the assistant text a prior response produced.
+
+    Prefers ``response._chunks`` because that's what both live streaming
+    and ``Response.from_row`` (the ``-c`` hydration path) populate. Falls
+    back to ``response.text()`` for any exotic Response subclass that
+    doesn't expose ``_chunks``. Returns ``""`` rather than raising so a
+    malformed prior turn can't break gating on the new prompt.
+    """
+    chunks = getattr(response, "_chunks", None)
+    if chunks:
+        return "".join(str(c) for c in chunks)
+    text_fn = getattr(response, "text", None)
+    if callable(text_fn):
+        try:
+            return text_fn() or ""
+        except Exception:
+            return ""
+    return ""
+
+
 def _attachment_bytes(a: Any) -> bytes | None:
     """Return bytes for an attachment without triggering a network fetch.
 
@@ -452,8 +490,49 @@ def _count_attachment_range(
     return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
 
 
+def _count_prior_turns(
+    count: Callable[[str], int], conversation: Any, provider: str
+) -> tuple[int, int]:
+    """Sum tokens for every prior user+assistant exchange in ``conversation``.
+
+    For each prior response we fold in:
+    - the user body (``prompt`` + fragments) — no system, since the
+      current turn already carries the system envelope the provider
+      will actually re-send.
+    - the user's attachments, which most providers re-encode on every
+      turn (images are re-uploaded as inline_data / base64 each time).
+    - the assistant's output text.
+
+    Tools and tool results from prior turns are deliberately skipped
+    here — matching the exact-mode adapters, which avoid them because
+    representing tool use faithfully requires alternating assistant/
+    user invariants the provider count endpoints validate. The overall
+    under-count is small in practice and the drift-warning path would
+    surface it if a workload depended on it.
+    """
+    low = high = 0
+    for prior in getattr(conversation, "responses", None) or []:
+        prior_prompt = getattr(prior, "prompt", None)
+        if prior_prompt is not None:
+            user_text = _prompt_user_text(prior_prompt)
+            if user_text:
+                n = count(user_text)
+                low += n
+                high += n
+            for a in getattr(prior_prompt, "attachments", []) or []:
+                a_low, a_high = _count_attachment_range(count, a, provider)
+                low += a_low
+                high += a_high
+        output_text = _response_output_text(prior)
+        if output_text:
+            n = count(output_text)
+            low += n
+            high += n
+    return (low, high)
+
+
 def count_prompt_tokens_range(
-    prompt: llm.Prompt, model: Any = None
+    prompt: llm.Prompt, model: Any = None, conversation: Any = None
 ) -> tuple[int, int]:
     """Return ``(low, high)`` token cost for ``prompt``.
 
@@ -463,6 +542,13 @@ def count_prompt_tokens_range(
     always; image-dim parse failures would too if we widened them).
     Callers that want a single number can use :func:`count_prompt_tokens`
     (returns the ``high`` bound — the conservative choice for gating).
+
+    When ``conversation`` is provided (e.g. ``llm -c``), the token
+    cost of every prior turn's user body, attachments and assistant
+    output is folded in — because that's what the model plugin will
+    actually re-send to the provider alongside the new prompt. Without
+    this the estimate silently under-counts a continued chat to the
+    size of just the latest message.
     """
     count = _make_counter()
     provider = _detect_provider(model)
@@ -496,10 +582,16 @@ def count_prompt_tokens_range(
         n = count(json.dumps(schema, default=str))
         low += n
         high += n
+    if conversation is not None:
+        prior_low, prior_high = _count_prior_turns(count, conversation, provider)
+        low += prior_low
+        high += prior_high
     return (low, high)
 
 
-def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
+def count_prompt_tokens(
+    prompt: llm.Prompt, model: Any = None, conversation: Any = None
+) -> int:
     """Estimate the full token cost of ``prompt`` before it is sent.
 
     Returns the ``high`` bound from :func:`count_prompt_tokens_range`
@@ -508,7 +600,7 @@ def count_prompt_tokens(prompt: llm.Prompt, model: Any = None) -> int:
     pessimistically. Callers that want both ends of the band should
     call :func:`count_prompt_tokens_range` directly.
     """
-    return count_prompt_tokens_range(prompt, model)[1]
+    return count_prompt_tokens_range(prompt, model, conversation)[1]
 
 
 _DRIFT_STASH_ATTR = "_confirm_tokens_heuristic"
@@ -516,7 +608,7 @@ _DRIFT_MODEL_STASH_ATTR = "_confirm_tokens_model_id"
 
 
 def estimate_tokens_detailed(
-    prompt: llm.Prompt, model: Any = None
+    prompt: llm.Prompt, model: Any = None, conversation: Any = None
 ) -> tuple[int, int, str]:
     """Return ``(low, high, source)`` for a pre-flight estimate of ``prompt``.
 
@@ -530,13 +622,19 @@ def estimate_tokens_detailed(
     local heuristic, but are *not* silent — a one-line notice goes to
     stderr so degradation is visible.
 
+    ``conversation`` — when set (e.g. ``llm -c``) — contributes the cost
+    of every prior turn's user body, attachments and assistant output
+    both to the heuristic range and to exact-mode adapters. Without it
+    a continued chat would silently under-count to the size of only the
+    newest message.
+
     The heuristic range is always computed and stashed on the prompt so
     the ``after_log_to_db`` hook can compare it against the billed count
     once the response arrives. That makes drift detection work even in
     heuristic-only mode — the mode where it matters most, because that's
     where users have no ground truth to sanity-check against locally.
     """
-    low, high = count_prompt_tokens_range(prompt, model)
+    low, high = count_prompt_tokens_range(prompt, model, conversation)
     _stash_heuristic(prompt, low, high, model)
 
     if model is not None and _exact_mode():
@@ -547,7 +645,7 @@ def estimate_tokens_detailed(
                 continue
             name = type(adapter).__name__.removesuffix("Adapter").lower() or "adapter"
             try:
-                exact = adapter.count(prompt, model)
+                exact = adapter.count(prompt, model, conversation=conversation)
                 _maybe_warn_drift(exact, low, high, name)
                 return (exact, exact, name)
             except Exception as exc:
@@ -620,14 +718,16 @@ def _maybe_warn_drift(
     )
 
 
-def estimate_tokens(prompt: llm.Prompt, model: Any = None) -> int:
+def estimate_tokens(
+    prompt: llm.Prompt, model: Any = None, conversation: Any = None
+) -> int:
     """Return a pre-flight token estimate for ``prompt`` (upper bound).
 
     Thin wrapper over :func:`estimate_tokens_detailed` for callers that
     only want a single number — returns the high bound of the range,
     matching :func:`count_prompt_tokens`.
     """
-    _, high, _ = estimate_tokens_detailed(prompt, model)
+    _, high, _ = estimate_tokens_detailed(prompt, model, conversation)
     return high
 
 
@@ -780,7 +880,9 @@ class ConfirmTokensGate:
         self._tokens_fn = tokens_fn
         self._ask = ask or _ask_via_tty
 
-    def _count(self, prompt: llm.Prompt, model: Any) -> tuple[int, int, str]:
+    def _count(
+        self, prompt: llm.Prompt, model: Any, conversation: Any
+    ) -> tuple[int, int, str]:
         """Return ``(low, high, source)``.
 
         When no ``tokens_fn`` was injected, we call
@@ -788,12 +890,26 @@ class ConfirmTokensGate:
         ("heuristic", "anthropic", "gemini", "openai") and the real
         range (wider on PDFs, collapsed elsewhere) both flow through
         to the confirmation message.
+
+        Custom ``tokens_fn`` callables are tried in order of richest to
+        sparsest signature: ``(prompt, model, conversation)`` →
+        ``(prompt, model)`` → ``(prompt,)``. That lets older injected
+        counters keep working while new ones can opt in to seeing
+        history.
         """
         if self._tokens_fn is None:
-            return estimate_tokens_detailed(prompt, model)
-        try:
-            result = self._tokens_fn(prompt, model)
-        except TypeError:
+            return estimate_tokens_detailed(prompt, model, conversation)
+        for args in (
+            (prompt, model, conversation),
+            (prompt, model),
+            (prompt,),
+        ):
+            try:
+                result = self._tokens_fn(*args)
+                break
+            except TypeError:
+                continue
+        else:
             result = self._tokens_fn(prompt)
         return _normalise_tokens_result(result)
 
@@ -805,8 +921,13 @@ class ConfirmTokensGate:
                 continue
         return self._ask(high)
 
-    def check(self, prompt: llm.Prompt, model: Any) -> None:
-        low, high, source = self._count(prompt, model)
+    def check(
+        self,
+        prompt: llm.Prompt,
+        model: Any,
+        conversation: Any = None,
+    ) -> None:
+        low, high, source = self._count(prompt, model, conversation)
         # Gate conservatively on the high bound — the "did I really
         # mean to send this much?" question is better answered
         # pessimistically when the estimate has a width.

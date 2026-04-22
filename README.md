@@ -18,41 +18,90 @@ conversation is not updated, and the CLI exits non-zero.
 
 ## Requirements
 
-This plugin depends on the `register_prompt_gates` hookspec, which is
-**not yet in upstream `llm`**.
+This plugin depends on **two hookspecs that are not yet in upstream
+`llm`**. Both live on branches of
+[olivergeorge/llm](https://github.com/olivergeorge/llm), pending
+upstream merge. The simplest way to satisfy both is to check out the
+combined branch; alternatively you can merge the two branches
+individually if you already carry other forks.
 
-`register_prompt_gates` lets a plugin register a gate that runs on the
-resolved prompt *immediately before* `Model.execute(...)` is called,
-and raise `llm.CancelPrompt` to abort the request before any tokens
-leave the machine. That's the whole feature — without the hookspec
-there is nowhere in `llm`'s surface to intercept a prompt at that
-point, and the plugin would have to monkey-patch `_BaseResponse` or
-subclass every `Model` (fragile across `llm` versions, hostile to
-other plugins).
+| Hook | Purpose in this plugin | Branch |
+| ---- | ---------------------- | ------ |
+| [`register_prompt_gates`](https://github.com/olivergeorge/llm/blob/llm-prompt-gates-hook/docs/plugins/plugin-hooks.md#register_prompt_gatesregister) | Register the gate that runs before `Model.execute` so we can count tokens and raise `CancelPrompt`. | [`llm-prompt-gates-hook`](https://github.com/olivergeorge/llm/tree/llm-prompt-gates-hook) |
+| [`after_log_to_db`](https://github.com/olivergeorge/llm/blob/llm-after-log-to-db/docs/plugins/plugin-hooks.md#after_log_to_dbresponse-db) | Fires after the real response has been persisted. Powers `LLM_CONFIRM_TOKENS_DRIFT_WARN` by comparing the pre-flight heuristic to the provider's billed `input_tokens`. | [`llm-after-log-to-db`](https://github.com/olivergeorge/llm/tree/llm-after-log-to-db) |
+| Both of the above + the replay-stores hookspec | Single-branch install. | [`combined-prs`](https://github.com/olivergeorge/llm/tree/combined-prs) |
 
-The hookspec lives on the `llm-prompt-gates-hook` branch of
-[olivergeorge/llm](https://github.com/olivergeorge/llm) (also merged
-into `llm-replay-combined` alongside the replay hookspecs) pending
-upstream merge.
+Without `register_prompt_gates` there is nowhere in `llm`'s surface to
+intercept a prompt before it leaves the machine — the plugin would have
+to monkey-patch `_BaseResponse` or subclass every `Model`, which is
+fragile across versions and hostile to other plugins. Without
+`after_log_to_db` the drift warning degrades to exact-mode-only (no
+signal when the heuristic drifts on a model without an exact-count
+adapter).
+
+### `register_prompt_gates` signature: `check(prompt, model, conversation=None)`
+
+Core calls each registered gate with three arguments:
+
+- `prompt` — the fully-resolved `llm.Prompt`.
+- `model` — the `llm.Model` that will execute the prompt.
+- `conversation` — the `llm.Conversation` the prompt belongs to, or
+  `None` for one-shot prompts.
+
+The `conversation` kwarg is what lets this plugin cost `llm -c`
+correctly — `conversation.responses` holds the prior turns the model
+plugin will re-send alongside the new prompt, and we fold them into
+the count.
+
+Two compatibility details in core:
+
+- Core passes `conversation` as a keyword argument and falls back to
+  `check(prompt, model)` if the gate's signature doesn't accept it, so
+  pre-existing gates keep working (they just won't see history).
+- Async responses invoke `acheck(prompt, model, conversation=None)`
+  when present, falling back to the sync `check` otherwise.
+
+If you're tracking a pinned revision of the fork, any commit on or
+after the "pass conversation to gate.check" change on
+`llm-prompt-gates-hook` (or its `combined-prs` equivalent) carries the
+`conversation` kwarg. Older gates on older cores still run, so the pin
+is forward-compatible.
+
+### Adapters still own provider wire formats — for now
+
+Today the plugin ships per-provider "exact count" adapters that
+rebuild each provider's `count_tokens` payload from the `Prompt` and
+`Conversation`. That's a duplicate of what the model plugins
+themselves do inside `Model.execute`, and it drifts every time a
+provider changes attachment shapes or role names. See
+[ADR 0001: Model-owned token counting](docs/adr/0001-model-owned-token-counting.md)
+for the proposal to move counting into the model plugins themselves
+(`Model.count_tokens(prompt, conversation)`), with the heuristic as
+the fallback — status: **draft**, feedback welcome.
 
 ## Install
 
-Install the fork of `llm` that carries the hookspec, then install the
-plugin against it:
+Install the fork of `llm` that carries both hookspecs, then install
+the plugin against it. `combined-prs` is the single-branch superset
+that carries `register_prompt_gates`, `after_log_to_db`, and the
+replay-stores hookspec in one place:
 
 ```bash
-# Clone and install the fork on the branch with the hookspec
-git clone -b llm-prompt-gates-hook https://github.com/olivergeorge/llm.git
+# Clone and install the fork on the combined branch
+git clone -b combined-prs https://github.com/olivergeorge/llm.git
 llm install -e ./llm
 
 # Install the plugin
 llm install llm-confirm-tokens
 ```
 
+If you only need gating (no drift warnings), `llm-prompt-gates-hook`
+is sufficient on its own.
+
 If you already have a local checkout of `../llm`, `pyproject.toml`
-points at it as an editable dependency — just check out the
-`llm-prompt-gates-hook` (or `llm-replay-combined`) branch there and
-run `uv sync` / `pip install -e .`.
+points at it as an editable dependency — check out `combined-prs`
+there (or `llm-prompt-gates-hook` if you don't need drift warnings)
+and run `uv sync` / `pip install -e .`.
 
 Accurate token counting uses `tiktoken`'s `cl100k_base` encoding; without
 it the plugin falls back to a `len(text) // 4` heuristic.
@@ -77,6 +126,22 @@ network calls:
 | Structured-output schema | JSON-serialised and tokenised |
 | URL-only attachments | flat 300 (never fetched) |
 | Unknown binary blobs | flat 300 |
+| Prior conversation turns (`llm -c` / `--cid`) | user body + attachments + assistant output, per turn |
+
+### Conversation history (`llm -c`)
+
+When a prompt is a continuation of an existing conversation, the model
+plugin replays every prior turn to the provider on the next request —
+so the bill on turn five of a chat includes everything from turns one
+through four. The gate sees this via a `conversation` argument core
+now passes through, and folds each prior turn's user body,
+attachments, and assistant output into the count. Without this, a
+continued chat would under-count to the size of only the newest
+message. System prompts are still counted exactly once (on the current
+turn), matching what providers actually accept. Tool calls and tool
+results from prior turns are skipped for the same reason they're
+skipped on the current-turn exact adapters — mis-structuring them can
+cause the count endpoint to reject the request.
 
 ### Image formula by provider
 

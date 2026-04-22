@@ -48,6 +48,19 @@ class _FakeAttachment:
         self.url = url
 
 
+class _FakeResponse:
+    """Duck-typed llm.Response stand-in for prior turns in a conversation."""
+
+    def __init__(self, prompt, output=""):
+        self.prompt = prompt
+        self._chunks = [output] if output else []
+
+
+class _FakeConversation:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+
+
 def test_gate_under_threshold_returns_without_asking():
     """Counts below threshold must not prompt the user at all."""
     asked = []
@@ -626,3 +639,66 @@ def test_count_prompt_tokens_includes_tools_and_schema():
         )
     )
     assert with_tools > bare
+
+
+def test_count_prompt_tokens_folds_in_conversation_history():
+    """``llm -c`` sends history too — the estimate must include it."""
+    new_prompt = _FakePrompt(prompt="what's next?")
+    bare = count_prompt_tokens(new_prompt)
+
+    prior = _FakeResponse(
+        prompt=_FakePrompt(prompt="the quick brown fox " * 50),
+        output="jumped over the lazy dog. " * 50,
+    )
+    with_history = count_prompt_tokens(
+        new_prompt, conversation=_FakeConversation([prior])
+    )
+    # History adds hundreds of tokens; the bare new prompt is a handful.
+    assert with_history - bare > 100
+
+
+def test_count_prompt_tokens_prior_turn_omits_system_to_avoid_double_count():
+    """Prior turns re-send the system only once — not on every historical turn.
+
+    The current prompt carries the system envelope that's actually about
+    to hit the wire. Counting each historical turn's system again would
+    over-inflate a long chat linearly with turn count.
+    """
+    system = "you are a helpful assistant. " * 20
+    prior_prompt = _FakePrompt(prompt="question one", system=system)
+    prior = _FakeResponse(prompt=prior_prompt, output="answer one")
+
+    # Current prompt also has the same system.
+    current = _FakePrompt(prompt="question two", system=system)
+    with_history = count_prompt_tokens(
+        current, conversation=_FakeConversation([prior])
+    )
+    # If we had double-counted the prior system we'd expect
+    # ``count(system) * 2`` extra tokens. Compare against a current-only
+    # count to make sure the overshoot is nowhere near that size.
+    current_only = count_prompt_tokens(current)
+    system_only = count_prompt_tokens(_FakePrompt(prompt="", system=system))
+    assert with_history < current_only + system_only
+
+
+def test_count_prompt_tokens_empty_conversation_equals_bare():
+    """A Conversation with no prior responses adds nothing to the count."""
+    prompt = _FakePrompt(prompt="hello")
+    assert count_prompt_tokens(
+        prompt, conversation=_FakeConversation([])
+    ) == count_prompt_tokens(prompt)
+
+
+def test_gate_check_accepts_conversation_kwarg():
+    """``ConfirmTokensGate.check`` consumes ``conversation`` kwarg from core."""
+    asked = []
+    gate = ConfirmTokensGate(
+        threshold=0,
+        tokens_fn=lambda p, m, c: (1000 if c else 10),
+        ask=lambda low, high, source: asked.append((low, high, source)) or True,
+    )
+    conv = _FakeConversation(
+        [_FakeResponse(_FakePrompt("old"), output="old answer")]
+    )
+    gate.check(_FakePrompt("new"), model=None, conversation=conv)
+    assert asked == [(1000, 1000, "heuristic")]

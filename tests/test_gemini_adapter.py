@@ -272,3 +272,50 @@ def test_gemini_adapter_ignored_when_anthropic_model_in_play(
     n = estimate_tokens(_FakePrompt("hi"), type("M", (), {"model_id": "claude-sonnet-4-5"})())
     assert n == 11
     assert fake_genai == []
+
+
+class _FakeResponse:
+    def __init__(self, prompt, output=""):
+        self.prompt = prompt
+        self._chunks = [output] if output else []
+
+
+class _FakeConversation:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+
+
+def test_adapter_builds_multi_turn_contents_with_model_role(fake_genai):
+    """Prior turns replay with Gemini's ``model`` role for assistant output."""
+    adapter = GeminiAdapter()
+    prior = _FakeResponse(_FakePrompt("first"), output="first reply")
+    adapter.count(
+        _FakePrompt("second"),
+        _FakeGemini(),
+        conversation=_FakeConversation([prior]),
+    )
+    contents = fake_genai[0]["contents"]
+    assert contents == [
+        {"role": "user", "parts": [{"text": "first"}]},
+        {"role": "model", "parts": [{"text": "first reply"}]},
+        {"role": "user", "parts": [{"text": "second"}]},
+    ]
+
+
+def test_adapter_system_stays_on_current_turn_only(fake_genai):
+    """System prompt inlines into the current turn — not replayed per prior turn."""
+    adapter = GeminiAdapter()
+    prior = _FakeResponse(_FakePrompt("earlier"), output="earlier reply")
+    adapter.count(
+        _FakePrompt("now", system="you are helpful"),
+        _FakeGemini(),
+        conversation=_FakeConversation([prior]),
+    )
+    contents = fake_genai[0]["contents"]
+    # The prior user turn must not carry the system text.
+    assert contents[0] == {"role": "user", "parts": [{"text": "earlier"}]}
+    # The current user turn gets system prepended to its parts.
+    assert contents[-1] == {
+        "role": "user",
+        "parts": [{"text": "you are helpful"}, {"text": "now"}],
+    }

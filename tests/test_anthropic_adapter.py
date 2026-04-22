@@ -283,3 +283,43 @@ def test_gate_legacy_single_arg_tokens_fn_still_works():
         ask=lambda n: True,
     )
     gate.check(_FakePrompt("hi"), model=None)  # must not raise
+
+
+class _FakeResponse:
+    def __init__(self, prompt, output=""):
+        self.prompt = prompt
+        self._chunks = [output] if output else []
+
+
+class _FakeConversation:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+
+
+def test_adapter_builds_multi_turn_messages_from_conversation(fake_anthropic):
+    """History replays as alternating user/assistant blocks before the new turn."""
+    adapter = AnthropicAdapter()
+    prior = _FakeResponse(_FakePrompt("first question"), output="first answer")
+    adapter.count(
+        _FakePrompt("follow-up"),
+        _FakeClaude(),
+        conversation=_FakeConversation([prior]),
+    )
+    messages = fake_anthropic[0]["messages"]
+    assert messages == [
+        {"role": "user", "content": [{"type": "text", "text": "first question"}]},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "first answer"}],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "follow-up"}]},
+    ]
+
+
+def test_adapter_no_conversation_matches_single_user_turn(fake_anthropic):
+    """Passing conversation=None must match the one-shot payload shape."""
+    adapter = AnthropicAdapter()
+    adapter.count(_FakePrompt("hi"), _FakeClaude(), conversation=None)
+    assert fake_anthropic[0]["messages"] == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+    ]

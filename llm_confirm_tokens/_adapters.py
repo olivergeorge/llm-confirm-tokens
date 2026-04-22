@@ -20,7 +20,26 @@ from typing import Any, Protocol
 
 class Adapter(Protocol):
     def matches(self, model: Any) -> bool: ...
-    def count(self, prompt: Any, model: Any) -> int: ...
+    def count(self, prompt: Any, model: Any, conversation: Any = ...) -> int: ...
+
+
+def _response_output_text(response: Any) -> str:
+    """Assistant text for a prior response.
+
+    Mirrors the heuristic-side helper in ``llm_confirm_tokens.__init__``
+    but kept local to the adapters to keep the adapter module importable
+    without the top-level package's heavier dependencies.
+    """
+    chunks = getattr(response, "_chunks", None)
+    if chunks:
+        return "".join(str(c) for c in chunks)
+    text_fn = getattr(response, "text", None)
+    if callable(text_fn):
+        try:
+            return text_fn() or ""
+        except Exception:
+            return ""
+    return ""
 
 
 def iter_adapters() -> Iterable[Adapter]:
@@ -140,29 +159,55 @@ class AnthropicAdapter:
                 return mid[len(prefix) :]
         return mid
 
-    def count(self, prompt: Any, model: Any) -> int:
+    @staticmethod
+    def _user_blocks(prompt: Any) -> list[dict]:
+        blocks: list[dict] = []
+        body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
+        if body:
+            blocks.append({"type": "text", "text": body})
+        for f in getattr(prompt, "fragments", []) or []:
+            blocks.append({"type": "text", "text": str(f)})
+        for a in getattr(prompt, "attachments", []) or []:
+            block = _attachment_content_block(a)
+            if block is not None:
+                blocks.append(block)
+        return blocks
+
+    def count(self, prompt: Any, model: Any, conversation: Any = None) -> int:
         from anthropic import Anthropic
 
         api_key = _get_anthropic_key()
         client = Anthropic(api_key=api_key) if api_key else Anthropic()
 
-        user_blocks: list[dict] = []
-        body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
-        if body:
-            user_blocks.append({"type": "text", "text": body})
-        for f in getattr(prompt, "fragments", []) or []:
-            user_blocks.append({"type": "text", "text": str(f)})
-        for a in getattr(prompt, "attachments", []) or []:
-            block = _attachment_content_block(a)
-            if block is not None:
-                user_blocks.append(block)
+        messages: list[dict] = []
+        # Prior turns first — Claude's Messages API requires alternating
+        # user/assistant roles, and that's what the model plugin will
+        # replay when continuing a conversation.
+        for prior in getattr(conversation, "responses", None) or []:
+            prior_prompt = getattr(prior, "prompt", None)
+            prior_user_blocks = (
+                self._user_blocks(prior_prompt) if prior_prompt is not None else []
+            )
+            if not prior_user_blocks:
+                prior_user_blocks = [{"type": "text", "text": ""}]
+            messages.append({"role": "user", "content": prior_user_blocks})
+            output = _response_output_text(prior)
+            if output:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": output}],
+                    }
+                )
 
+        user_blocks = self._user_blocks(prompt)
         if not user_blocks:
             user_blocks = [{"type": "text", "text": ""}]
+        messages.append({"role": "user", "content": user_blocks})
 
         kwargs: dict[str, Any] = {
             "model": self._model_id(model),
-            "messages": [{"role": "user", "content": user_blocks}],
+            "messages": messages,
         }
 
         system_parts: list[str] = []
@@ -280,21 +325,9 @@ class GeminiAdapter:
                 return mid[len(prefix) :]
         return mid
 
-    def count(self, prompt: Any, model: Any) -> int:
-        from google import genai
-
-        api_key = _get_gemini_key()
-        client = genai.Client(api_key=api_key) if api_key else genai.Client()
-
+    @staticmethod
+    def _user_parts(prompt: Any) -> list[dict]:
         parts: list[dict] = []
-        # System prompt / fragments go first as leading text parts. See
-        # class docstring for why this isn't routed via CountTokensConfig.
-        system = getattr(prompt, "system", None)
-        if system:
-            parts.append({"text": system})
-        for sf in getattr(prompt, "system_fragments", []) or []:
-            parts.append({"text": str(sf)})
-
         body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
         if body:
             parts.append({"text": body})
@@ -304,11 +337,46 @@ class GeminiAdapter:
             part = _gemini_part_from_attachment(a)
             if part is not None:
                 parts.append(part)
+        return parts
 
-        if not parts:
-            parts = [{"text": ""}]
+    def count(self, prompt: Any, model: Any, conversation: Any = None) -> int:
+        from google import genai
 
-        contents = [{"role": "user", "parts": parts}]
+        api_key = _get_gemini_key()
+        client = genai.Client(api_key=api_key) if api_key else genai.Client()
+
+        contents: list[dict] = []
+
+        # System prompt / fragments are inlined as a leading user-role
+        # part on the *current* turn only — sending them on every prior
+        # turn would multi-count the system envelope. See class docstring
+        # for why we don't route this via CountTokensConfig.
+        system_parts: list[dict] = []
+        system = getattr(prompt, "system", None)
+        if system:
+            system_parts.append({"text": system})
+        for sf in getattr(prompt, "system_fragments", []) or []:
+            system_parts.append({"text": str(sf)})
+
+        # Replay prior turns — Gemini's role for assistant messages is
+        # "model", not "assistant".
+        for prior in getattr(conversation, "responses", None) or []:
+            prior_prompt = getattr(prior, "prompt", None)
+            parts = (
+                self._user_parts(prior_prompt) if prior_prompt is not None else []
+            )
+            if not parts:
+                parts = [{"text": ""}]
+            contents.append({"role": "user", "parts": parts})
+            output = _response_output_text(prior)
+            if output:
+                contents.append({"role": "model", "parts": [{"text": output}]})
+
+        current_parts = system_parts + self._user_parts(prompt)
+        if not current_parts:
+            current_parts = [{"text": ""}]
+        contents.append({"role": "user", "parts": current_parts})
+
         response = client.models.count_tokens(
             model=self._model_id(model),
             contents=contents,
@@ -415,28 +483,54 @@ class OpenAIAdapter:
                 return mid[len(prefix) :]
         return mid
 
-    def count(self, prompt: Any, model: Any) -> int:
+    @staticmethod
+    def _user_content(prompt: Any) -> list[dict]:
+        content: list[dict] = []
+        body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
+        if body:
+            content.append({"type": "input_text", "text": body})
+        for f in getattr(prompt, "fragments", []) or []:
+            content.append({"type": "input_text", "text": str(f)})
+        for a in getattr(prompt, "attachments", []) or []:
+            part = _openai_input_part(a)
+            if part is not None:
+                content.append(part)
+        return content
+
+    def count(self, prompt: Any, model: Any, conversation: Any = None) -> int:
         from openai import OpenAI
 
         api_key = _get_openai_key()
         client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
-        user_content: list[dict] = []
-        body = getattr(prompt, "prompt", None) or getattr(prompt, "_prompt", None)
-        if body:
-            user_content.append({"type": "input_text", "text": body})
-        for f in getattr(prompt, "fragments", []) or []:
-            user_content.append({"type": "input_text", "text": str(f)})
-        for a in getattr(prompt, "attachments", []) or []:
-            part = _openai_input_part(a)
-            if part is not None:
-                user_content.append(part)
+        input_messages: list[dict] = []
+        for prior in getattr(conversation, "responses", None) or []:
+            prior_prompt = getattr(prior, "prompt", None)
+            prior_content = (
+                self._user_content(prior_prompt) if prior_prompt is not None else []
+            )
+            if not prior_content:
+                prior_content = [{"type": "input_text", "text": ""}]
+            input_messages.append({"role": "user", "content": prior_content})
+            output = _response_output_text(prior)
+            if output:
+                # Responses API expects assistant turns to use
+                # ``output_text`` (the mirror of ``input_text``).
+                input_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": output}],
+                    }
+                )
+
+        user_content = self._user_content(prompt)
         if not user_content:
             user_content = [{"type": "input_text", "text": ""}]
+        input_messages.append({"role": "user", "content": user_content})
 
         kwargs: dict[str, Any] = {
             "model": self._model_id(model),
-            "input": [{"role": "user", "content": user_content}],
+            "input": input_messages,
         }
 
         system_parts: list[str] = []

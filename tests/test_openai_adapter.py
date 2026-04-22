@@ -225,3 +225,40 @@ def test_gate_uses_openai_exact_count_via_adapter(fake_openai, monkeypatch):
     gate = ConfirmTokensGate(threshold=0, ask=lambda n: asked.append(n) or True)
     gate.check(_FakePrompt("hi"), _FakeGPT())
     assert asked == [314]
+
+
+class _FakeResponse:
+    def __init__(self, prompt, output=""):
+        self.prompt = prompt
+        self._chunks = [output] if output else []
+
+
+class _FakeConversation:
+    def __init__(self, responses=()):
+        self.responses = list(responses)
+
+
+def test_adapter_builds_multi_turn_input_with_output_text(fake_openai):
+    """Prior turns replay as alternating user/assistant using output_text."""
+    adapter = OpenAIAdapter()
+    prior = _FakeResponse(_FakePrompt("earlier"), output="earlier answer")
+    adapter.count(
+        _FakePrompt("now"),
+        _FakeGPT(),
+        conversation=_FakeConversation([prior]),
+    )
+    input_messages = fake_openai[0]["input"]
+    assert input_messages == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "earlier"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "earlier answer"}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "now"}],
+        },
+    ]
