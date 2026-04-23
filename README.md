@@ -283,7 +283,8 @@ Options via environment variables:
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `LLM_CONFIRM_TOKENS` | *unset* | Set to `1` / `true` / `yes` / `on` to register the gate. Unset or `0` means "plugin installed but inactive". |
-| `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number. `0` means confirm on every prompt. |
+| `LLM_CONFIRM_TOKENS_THRESHOLD` | `0` | Only prompt when the estimated token count is at or above this number (the floor of "ask me"). `0` means confirm on every prompt. |
+| `LLM_CONFIRM_TOKENS_MAX` | `0` | Hard ceiling — cancel without asking when the estimate reaches this number. `0` means no ceiling. Evaluated before `LLM_CONFIRM_TOKENS_YES`, so scripts that auto-approve can still refuse runaway payloads. |
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
 | `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
 | `LLM_CONFIRM_TOKENS_DRIFT_WARN` | *unset* | Percentage threshold for drift warnings. Compares the pre-flight heuristic against the billed count (after the response completes) — and, when exact mode is on, also against the exact count (before the response is sent). Off by default to keep the gate quiet. |
@@ -311,6 +312,49 @@ If exact mode is enabled but the adapter fails (missing key, network
 flake, SDK too old), the plugin falls back to the heuristic and
 writes a one-line notice to stderr so you know silent degradation
 isn't happening.
+
+### Recipes
+
+`THRESHOLD`, `MAX`, and `YES` compose into three bands — auto-approve
+small prompts, confirm mid-sized ones, refuse anything huge — which
+covers most of the workflows this plugin was built for:
+
+```bash
+# Interactive shell: confirm every prompt above 1k tokens, refuse anything
+# that would send more than 50k. Small prompts go through silently.
+export LLM_CONFIRM_TOKENS=1
+export LLM_CONFIRM_TOKENS_THRESHOLD=1000
+export LLM_CONFIRM_TOKENS_MAX=50000
+```
+
+```bash
+# "Let me pipe anything into Gemini Pro, but cap the blast radius."
+# MAX trumps YES, so you never get asked but you also never send >50k.
+alias llm-gemini='LLM_CONFIRM_TOKENS=1 LLM_CONFIRM_TOKENS_YES=1 \
+  LLM_CONFIRM_TOKENS_MAX=50000 llm -m gemini-pro'
+```
+
+```bash
+# Batch script: auto-approve everything, but bail out if a single prompt
+# ever balloons past your sanity budget. Exits non-zero so `set -e` works.
+LLM_CONFIRM_TOKENS=1 LLM_CONFIRM_TOKENS_YES=1 LLM_CONFIRM_TOKENS_MAX=200000 \
+  my-batch-script.sh
+```
+
+`LLM_CONFIRM_TOKENS_MAX` compares the **heuristic's upper bound** by
+default — the same conservative choice the confirmation prompt uses.
+That means the ceiling can fire on a PDF whose true cost lands well
+below the bound (see "PDF per-page rate" above). If you need a
+billing-grade ceiling, pair it with exact mode:
+
+```bash
+export LLM_CONFIRM_TOKENS_EXACT=1
+export LLM_CONFIRM_TOKENS_MAX=50000
+```
+
+Exact mode collapses the range to a single provider-supplied number,
+so `MAX` refuses only when the provider itself says the request is
+over budget.
 
 ## Differences & assumptions per adapter
 

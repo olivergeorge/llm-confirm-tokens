@@ -108,6 +108,71 @@ def test_gate_assume_yes_env_bypasses_prompt(monkeypatch):
     assert asked == []
 
 
+def test_gate_max_tokens_below_ceiling_proceeds():
+    """Counts below the hard ceiling behave like a normal prompt."""
+    gate = ConfirmTokensGate(
+        threshold=0,
+        max_tokens=1000,
+        tokens_fn=lambda p: 500,
+        ask=lambda low, high, source: True,
+    )
+    gate.check(_FakePrompt("hi"), model=None)  # must not raise
+
+
+def test_gate_max_tokens_at_ceiling_raises_without_asking():
+    """At or above the ceiling we refuse and never consult ``ask``."""
+    asked: list[object] = []
+    gate = ConfirmTokensGate(
+        threshold=0,
+        max_tokens=1000,
+        tokens_fn=lambda p: 1000,
+        ask=lambda low, high, source: asked.append(source) or True,
+    )
+    with pytest.raises(llm.CancelPrompt, match=r"LLM_CONFIRM_TOKENS_MAX=1,000"):
+        gate.check(_FakePrompt("hi"), model=None)
+    assert asked == []
+
+
+def test_gate_max_tokens_trumps_assume_yes(monkeypatch):
+    """The ceiling fires even when LLM_CONFIRM_TOKENS_YES=1 is set.
+
+    This is the Gemini-Pro scenario: "auto-approve everything small,
+    but refuse anything huge no matter what."
+    """
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_YES", "1")
+    gate = ConfirmTokensGate(
+        threshold=0,
+        max_tokens=50_000,
+        tokens_fn=lambda p: 80_000,
+        ask=lambda *_a: True,
+    )
+    with pytest.raises(llm.CancelPrompt, match="exceeds LLM_CONFIRM_TOKENS_MAX"):
+        gate.check(_FakePrompt("hi"), model=None)
+
+
+def test_gate_max_tokens_zero_disables_ceiling():
+    """max_tokens=0 (the default) must never refuse on its own."""
+    gate = ConfirmTokensGate(
+        threshold=0,
+        max_tokens=0,
+        tokens_fn=lambda p: 10_000_000,
+        ask=lambda *_a: True,
+    )
+    gate.check(_FakePrompt("hi"), model=None)  # must not raise
+
+
+def test_register_prompt_gates_picks_up_max_env(monkeypatch):
+    """LLM_CONFIRM_TOKENS_MAX flows through to the registered gate."""
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS", "1")
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_MAX", "50000")
+    registered: list[object] = []
+    register_prompt_gates(register=registered.append)
+    assert len(registered) == 1
+    gate = registered[0]
+    assert isinstance(gate, ConfirmTokensGate)
+    assert gate.max_tokens == 50_000
+
+
 def test_register_prompt_gates_is_noop_when_disabled(monkeypatch):
     """Without LLM_CONFIRM_TOKENS set, the plugin registers no gates."""
     monkeypatch.delenv("LLM_CONFIRM_TOKENS", raising=False)

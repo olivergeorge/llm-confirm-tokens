@@ -60,6 +60,15 @@ def _threshold() -> int:
         return 0
 
 
+def _max_tokens() -> int:
+    """Parse ``LLM_CONFIRM_TOKENS_MAX`` — unset or 0 means no ceiling."""
+    raw = os.environ.get("LLM_CONFIRM_TOKENS_MAX", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 # Fallback image cost used when we can't read the image's dimensions —
 # 258 matches Gemini's flat "small image" cost and is within a round
 # of the three providers' per-image baselines. When we *can* read
@@ -873,10 +882,12 @@ class ConfirmTokensGate:
         self,
         *,
         threshold: int = 0,
+        max_tokens: int = 0,
         tokens_fn: Callable[..., int] | None = None,
         ask: Callable[..., bool] | None = None,
     ) -> None:
         self.threshold = threshold
+        self.max_tokens = max_tokens
         self._tokens_fn = tokens_fn
         self._ask = ask or _ask_via_tty
 
@@ -931,6 +942,13 @@ class ConfirmTokensGate:
         # Gate conservatively on the high bound — the "did I really
         # mean to send this much?" question is better answered
         # pessimistically when the estimate has a width.
+        if self.max_tokens and high >= self.max_tokens:
+            # Hard ceiling trumps YES so scripts that auto-approve can
+            # still refuse runaway payloads.
+            total = _format_total(low, high, source)
+            raise llm.CancelPrompt(
+                f"{total} exceeds LLM_CONFIRM_TOKENS_MAX={self.max_tokens:,}"
+            )
         if high < self.threshold:
             return
         if _assume_yes():
@@ -972,7 +990,7 @@ def register_prompt_gates(register: Any) -> None:
     """
     if not _is_enabled():
         return
-    register(ConfirmTokensGate(threshold=_threshold()))
+    register(ConfirmTokensGate(threshold=_threshold(), max_tokens=_max_tokens()))
 
 
 @hookimpl
