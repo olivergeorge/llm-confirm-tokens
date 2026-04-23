@@ -754,6 +754,78 @@ def test_count_prompt_tokens_empty_conversation_equals_bare():
     ) == count_prompt_tokens(prompt)
 
 
+def test_gate_dry_run_prints_and_exits_without_asking(monkeypatch, capsys):
+    """LLM_CONFIRM_TOKENS_DRY_RUN=1: emit estimate, exit 0, never consult ``ask``."""
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRY_RUN", "1")
+    asked: list[object] = []
+    gate = ConfirmTokensGate(
+        threshold=0,
+        tokens_fn=lambda p: 1234,
+        ask=lambda *_a: asked.append(_a) or False,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        gate.check(_FakePrompt("hello"), model=None)
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "1234"  # raw integer on stdout for scripts
+    assert "1.2k input tokens (estimate)" in captured.err
+    assert asked == []
+
+
+def test_gate_dry_run_skips_max_ceiling(monkeypatch, capsys):
+    """Dry-run ignores LLM_CONFIRM_TOKENS_MAX — user only wants the number."""
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRY_RUN", "1")
+    gate = ConfirmTokensGate(
+        threshold=0,
+        max_tokens=100,
+        tokens_fn=lambda p: 99_999,
+        ask=lambda *_a: True,
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        gate.check(_FakePrompt("hi"), model=None)
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == "99999"
+
+
+def test_gate_dry_run_skips_assume_yes(monkeypatch, capsys):
+    """YES would proceed silently, but DRY_RUN must still print the estimate."""
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRY_RUN", "1")
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_YES", "1")
+    gate = ConfirmTokensGate(
+        threshold=0,
+        tokens_fn=lambda p: 500,
+        ask=lambda *_a: True,
+    )
+    with pytest.raises(SystemExit):
+        gate.check(_FakePrompt("hi"), model=None)
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "500"
+    assert "500 input tokens (estimate)" in captured.err
+
+
+def test_gate_dry_run_ignores_threshold(monkeypatch, capsys):
+    """Tiny prompts under threshold still emit in dry-run — always show the count."""
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRY_RUN", "1")
+    gate = ConfirmTokensGate(
+        threshold=10_000,
+        tokens_fn=lambda p: 42,
+        ask=lambda *_a: True,
+    )
+    with pytest.raises(SystemExit):
+        gate.check(_FakePrompt("hi"), model=None)
+    assert capsys.readouterr().out.strip() == "42"
+
+
+def test_register_prompt_gates_registers_when_dry_run_only(monkeypatch):
+    """DRY_RUN alone is enough — no need to also set LLM_CONFIRM_TOKENS=1."""
+    monkeypatch.delenv("LLM_CONFIRM_TOKENS", raising=False)
+    monkeypatch.setenv("LLM_CONFIRM_TOKENS_DRY_RUN", "1")
+    registered: list[object] = []
+    register_prompt_gates(register=registered.append)
+    assert len(registered) == 1
+    assert isinstance(registered[0], ConfirmTokensGate)
+
+
 def test_gate_check_accepts_conversation_kwarg():
     """``ConfirmTokensGate.check`` consumes ``conversation`` kwarg from core."""
     asked = []

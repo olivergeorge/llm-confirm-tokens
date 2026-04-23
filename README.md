@@ -288,6 +288,7 @@ Options via environment variables:
 | `LLM_CONFIRM_TOKENS_YES` | *unset* | Auto-approve without prompting. Useful inside `LLM_CONFIRM_TOKENS=1` shells when running a batch script you trust. |
 | `LLM_CONFIRM_TOKENS_EXACT` | *unset* | Opt-in: use provider-native count APIs instead of the local heuristic when a matching SDK is installed. See "Exact counts" below. |
 | `LLM_CONFIRM_TOKENS_DRIFT_WARN` | *unset* | Percentage threshold for drift warnings. Compares the pre-flight heuristic against the billed count (after the response completes) — and, when exact mode is on, also against the exact count (before the response is sent). Off by default to keep the gate quiet. |
+| `LLM_CONFIRM_TOKENS_DRY_RUN` | *unset* | Count tokens and exit 0 without sending the prompt. Prints the human-readable estimate to stderr and the raw integer to stdout, so `TOKENS=$(LLM_CONFIRM_TOKENS_DRY_RUN=1 llm …)` captures the number cleanly. Bypasses `THRESHOLD`, `MAX`, and `YES` — the user asked for the number, not a gate. Registers the gate on its own, so you do not also need `LLM_CONFIRM_TOKENS=1`. |
 
 The confirmation is read from `/dev/tty` (POSIX) or `CONIN$` (Windows),
 so the plugin works correctly even when `stdin` is piped
@@ -339,6 +340,13 @@ alias llm-gemini='LLM_CONFIRM_TOKENS=1 LLM_CONFIRM_TOKENS_YES=1 \
 # ever balloons past your sanity budget. Exits non-zero so `set -e` works.
 LLM_CONFIRM_TOKENS=1 LLM_CONFIRM_TOKENS_YES=1 LLM_CONFIRM_TOKENS_MAX=200000 \
   my-batch-script.sh
+```
+
+```bash
+# Dry run: print the count, don't send the prompt. Raw integer on stdout,
+# human-readable estimate on stderr, exits 0 so set -e scripts are happy.
+TOKENS=$(LLM_CONFIRM_TOKENS_DRY_RUN=1 llm -m gpt-4o -f big.md 'summarise')
+echo "would send $TOKENS tokens"
 ```
 
 `LLM_CONFIRM_TOKENS_MAX` compares the **heuristic's upper bound** by

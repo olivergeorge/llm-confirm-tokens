@@ -47,6 +47,17 @@ def _assume_yes() -> bool:
     return os.environ.get("LLM_CONFIRM_TOKENS_YES", "").strip().lower() in _TRUTHY
 
 
+def _dry_run() -> bool:
+    """Print the estimate and exit 0 instead of sending the prompt.
+
+    Separate from ``LLM_CONFIRM_TOKENS`` because dry-run is a "just tell
+    me the number" use case — forcing users to also set the gate-enable
+    var would be friction for no reason. ``register_prompt_gates``
+    treats either flag as enough to register the gate.
+    """
+    return os.environ.get("LLM_CONFIRM_TOKENS_DRY_RUN", "").strip().lower() in _TRUTHY
+
+
 def _exact_mode() -> bool:
     """Opt-in flag for using provider count APIs instead of local heuristics."""
     return os.environ.get("LLM_CONFIRM_TOKENS_EXACT", "").strip().lower() in _TRUTHY
@@ -787,6 +798,28 @@ def _format_total(low: int, high: int, source: str) -> str:
     return f"{number} input tokens ({label})"
 
 
+def _emit_dry_run(low: int, high: int, source: str) -> None:
+    """Print the estimate and exit 0 — never returns.
+
+    Splits the output across streams so scripts can consume either:
+    the human-readable line (with source + range when applicable) goes
+    to stderr, and a single integer — the conservative ``high`` bound,
+    matching :func:`count_prompt_tokens` — goes to stdout. That lets
+    ``TOKENS=$(LLM_CONFIRM_TOKENS_DRY_RUN=1 llm -m gpt-4o 'hi')`` work
+    cleanly.
+
+    Exits 0 rather than raising ``llm.CancelPrompt`` because a dry-run
+    is a successful operation: the user asked for a number and got one.
+    ``CancelPrompt`` would print a "canceled" notice and exit non-zero,
+    which ``set -e`` scripts would treat as a failure.
+    """
+    sys.stderr.write(f"{_format_total(low, high, source)}\n")
+    sys.stderr.flush()
+    sys.stdout.write(f"{high}\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+
 def _ask_via_tty(
     low: int, high: int | None = None, source: str = "heuristic"
 ) -> bool:
@@ -939,6 +972,11 @@ class ConfirmTokensGate:
         conversation: Any = None,
     ) -> None:
         low, high, source = self._count(prompt, model, conversation)
+        # Dry-run short-circuits everything else — threshold, max, and
+        # yes are gating concerns, but the user only asked for the number.
+        # Exits 0 so scripts can consume stdout without set -e pain.
+        if _dry_run():
+            _emit_dry_run(low, high, source)
         # Gate conservatively on the high bound — the "did I really
         # mean to send this much?" question is better answered
         # pessimistically when the estimate has a width.
@@ -987,8 +1025,11 @@ def register_prompt_gates(register: Any) -> None:
 
     Keyed on the ``LLM_CONFIRM_TOKENS`` env var so the plugin is a no-op
     for users who have installed it but not opted in.
+    ``LLM_CONFIRM_TOKENS_DRY_RUN=1`` also registers the gate on its own
+    so users can count-without-sending without having to also flip the
+    confirmation gate on.
     """
-    if not _is_enabled():
+    if not (_is_enabled() or _dry_run()):
         return
     register(ConfirmTokensGate(threshold=_threshold(), max_tokens=_max_tokens()))
 
