@@ -370,6 +370,124 @@ def test_image_jpeg_dimensions_parse():
     assert 900 <= (n - bare) <= 1100
 
 
+def _wav_with_byte_rate(seconds: int, byte_rate: int = 8000) -> bytes:
+    """Build a minimal RIFF/WAVE byte string of ``seconds`` audio.
+
+    16-byte fmt chunk for PCM, then a ``data`` chunk of ``seconds *
+    byte_rate`` zero bytes — exactly what the heuristic's
+    ``_wav_duration_seconds`` reads.
+    """
+    import struct
+
+    fmt_chunk = (
+        b"fmt "
+        + struct.pack("<I", 16)
+        + struct.pack("<HHIIHH", 1, 1, byte_rate, byte_rate, 1, 8)
+    )
+    data_size = seconds * byte_rate
+    data_chunk = b"data" + struct.pack("<I", data_size) + b"\x00" * data_size
+    body = b"WAVE" + fmt_chunk + data_chunk
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def _m4a_with_duration(seconds: int, timescale: int = 1000) -> bytes:
+    """Build a minimal MP4 byte string carrying a v0 ``mvhd`` atom.
+
+    Contains just an ``ftyp`` (so magic-byte sniffing recognises it
+    when the mime is generic) and a ``moov > mvhd`` chain — exactly
+    what ``_mp4_duration_seconds`` walks.
+    """
+    import struct
+
+    def _box(type_: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(payload)) + type_ + payload
+
+    duration_units = seconds * timescale
+    mvhd_payload = (
+        b"\x00\x00\x00\x00"  # version 0 + flags
+        + b"\x00\x00\x00\x00"  # creation time
+        + b"\x00\x00\x00\x00"  # modification time
+        + struct.pack(">I", timescale)
+        + struct.pack(">I", duration_units)
+    )
+    moov = _box(b"moov", _box(b"mvhd", mvhd_payload))
+    ftyp = _box(b"ftyp", b"M4A \x00\x00\x00\x00M4A mp42isom")
+    return ftyp + moov
+
+
+class _FakeAudio:
+    def __init__(self, content, type_="audio/wav"):
+        self.content = content
+        self.path = None
+        self.url = None
+        self.type = type_
+
+
+def test_audio_wav_uses_header_duration_at_gemini_rate():
+    """A 60-second WAV bills at 60 × 32 = 1920 tokens for Gemini (default)."""
+    from llm_confirm_tokens import count_prompt_tokens_range
+
+    wav = _wav_with_byte_rate(seconds=60)
+    prompt = _FakePrompt("hi", attachments=[_FakeAudio(wav, type_="audio/wav")])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    low, high = count_prompt_tokens_range(prompt)
+    # WAV duration is exact → range collapses.
+    assert low == high
+    assert (high - bare) == 60 * 32
+
+
+def test_audio_m4a_uses_mvhd_duration_at_gemini_rate():
+    """An m4a with mvhd duration = 600s bills at 600 × 32 = 19200 tokens."""
+    from llm_confirm_tokens import count_prompt_tokens_range
+
+    m4a = _m4a_with_duration(seconds=600, timescale=1000)
+    prompt = _FakePrompt("hi", attachments=[_FakeAudio(m4a, type_="audio/mp4")])
+    bare = count_prompt_tokens(_FakePrompt("hi"))
+    low, high = count_prompt_tokens_range(prompt)
+    assert low == high
+    assert (high - bare) == 600 * 32
+
+
+def test_audio_unparseable_falls_back_to_wide_size_based_range():
+    """Audio bytes we can't parse return a wide ``low–high`` range that
+    brackets typical bitrates — the honest "could blow up" signal that
+    matters for bill-shock prevention. The flat 300-token bucket the
+    prior code used would have collapsed this to a single number.
+    """
+    from llm_confirm_tokens import count_prompt_tokens_range
+
+    # 1MB of opaque audio bytes, no parseable header (no RIFF, no ftyp).
+    opaque = b"\x00" * 1_048_576
+    prompt = _FakePrompt("hi", attachments=[_FakeAudio(opaque, type_="audio/mpeg")])
+    bare_low, bare_high = count_prompt_tokens_range(_FakePrompt("hi"))
+    low, high = count_prompt_tokens_range(prompt)
+    audio_low = low - bare_low
+    audio_high = high - bare_high
+    # 1MB at 256kbps = 32.7s → 1048 tok; at 16kbps = 524s → 16768 tok.
+    # The point of the test is that the range is *wide*, not the exact
+    # bracket — assert order of magnitude.
+    assert audio_high >= audio_low * 4
+    assert audio_low >= 1000  # well above the old _UNKNOWN_BINARY_TOKENS=300
+
+
+def test_audio_url_only_falls_back_to_unknown_binary():
+    """URL-only audio (no bytes available) can't even be size-estimated."""
+    from llm_confirm_tokens import count_prompt_tokens_range
+
+    class _UrlAudio:
+        content = None
+        path = None
+        url = "https://example.com/clip.mp3"
+        type = "audio/mpeg"
+
+    prompt = _FakePrompt("hi", attachments=[_UrlAudio()])
+    bare_high = count_prompt_tokens(_FakePrompt("hi"))
+    low, high = count_prompt_tokens_range(prompt)
+    # Same flat bucket as any other URL-only opaque binary.
+    assert (high - bare_high) == 300
+    assert low == high
+
+
 def test_drift_warn_fires_when_actual_exceeds_high(monkeypatch, capsys):
     """Bill-shock case: actual exceeds the heuristic's upper bound → warn."""
     from llm_confirm_tokens import _maybe_warn_drift

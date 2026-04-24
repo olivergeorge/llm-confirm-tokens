@@ -142,6 +142,34 @@ def _pdf_tokens_per_page_range(provider: str) -> tuple[int, int]:
         provider, _PDF_TOKENS_PER_PAGE_RANGE["gemini"]
     )
 
+
+# Audio billing rate, tokens per second of audio.
+# - Gemini: documented at 32 tokens/sec
+#   https://ai.google.dev/gemini-api/docs/tokens
+# - Anthropic: doesn't accept audio inputs (the API call will reject
+#   the request). Using Gemini's rate so the gate still surfaces a
+#   plausible scale rather than a flat 300-token guess.
+# - OpenAI: gpt-4o-audio-preview has model-specific billing that
+#   isn't published as a single per-second number; Gemini's rate is a
+#   directional default until someone has a concrete number to
+#   substitute.
+_AUDIO_TOKENS_PER_SECOND: dict[str, int] = {
+    "gemini": 32,
+    "anthropic": 32,
+    "openai": 32,
+}
+
+
+# Bitrate band used to convert an audio file's byte size into a
+# duration range when we can't parse the container header. The lower
+# seconds bound assumes a dense ~256kbps file (music-grade m4a/mp3);
+# the upper bound assumes a sparse ~16kbps file (low-bitrate Opus
+# voice). The width is intentional — a wide "5k–160k tokens" estimate
+# is the honest signal that this could blow up, vs. a single
+# confidently-wrong number that lulls the user into hitting Y.
+_AUDIO_BITRATE_HIGH_BPS = 256_000
+_AUDIO_BITRATE_LOW_BPS = 16_000
+
 # PDF /Type /Page entries: accurate for uncompressed PDFs, an under-count
 # for PDFs whose object streams are compressed. The byte-size fallback in
 # ``_pdf_page_count`` papers over that common case.
@@ -296,6 +324,158 @@ def _pdf_page_count(data: bytes) -> int:
     if regex_count > 0:
         return regex_count
     return max(1, len(data) // 50_000)
+
+
+def _wav_duration_seconds(data: bytes) -> int | None:
+    """Return integer seconds of audio for a RIFF/WAVE file, else ``None``.
+
+    Reads the canonical RIFF chunk sequence: ``fmt `` carries the byte
+    rate at offset 8 of its payload, and ``data`` carries the audio
+    payload size — duration is ``data_size / byte_rate``. Returns
+    ``None`` for malformed headers rather than raising; the caller
+    falls back to the bitrate-band estimate.
+    """
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    pos = 12
+    end = len(data)
+    byte_rate: int | None = None
+    data_size: int | None = None
+    while pos + 8 <= end:
+        chunk_id = data[pos : pos + 4]
+        chunk_size = struct.unpack("<I", data[pos + 4 : pos + 8])[0]
+        if chunk_id == b"fmt " and chunk_size >= 16 and pos + 8 + 16 <= end:
+            # Bytes/sec is a 32-bit LE int at offset 8 of the fmt payload.
+            byte_rate = struct.unpack("<I", data[pos + 16 : pos + 20])[0]
+        elif chunk_id == b"data":
+            data_size = chunk_size
+            break
+        pos += 8 + chunk_size
+        # RIFF chunks are word-aligned to 2 bytes.
+        if chunk_size % 2:
+            pos += 1
+    if byte_rate and data_size:
+        return max(1, data_size // byte_rate)
+    return None
+
+
+def _mp4_find_mvhd_seconds(payload: bytes) -> int | None:
+    """Walk an MP4 ``moov`` payload, return movie duration in seconds.
+
+    The ``mvhd`` box carries the timescale + duration as either a v0
+    (32-bit) or v1 (64-bit) record. Returns ``None`` if not found or
+    if the box is malformed.
+    """
+    pos = 0
+    end = len(payload)
+    while pos + 8 <= end:
+        size = struct.unpack(">I", payload[pos : pos + 4])[0]
+        type_ = payload[pos + 4 : pos + 8]
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                return None
+            size = struct.unpack(">Q", payload[pos + 8 : pos + 16])[0]
+            header = 16
+        if size < header or pos + size > end:
+            return None
+        if type_ == b"mvhd":
+            box = payload[pos + header : pos + size]
+            if len(box) < 4:
+                return None
+            version = box[0]
+            try:
+                if version == 0 and len(box) >= 20:
+                    timescale, duration = struct.unpack(">II", box[12:20])
+                elif version == 1 and len(box) >= 32:
+                    timescale = struct.unpack(">I", box[20:24])[0]
+                    duration = struct.unpack(">Q", box[24:32])[0]
+                else:
+                    return None
+            except struct.error:
+                return None
+            if timescale > 0:
+                return max(1, duration // timescale)
+            return None
+        pos += size
+    return None
+
+
+def _mp4_duration_seconds(data: bytes) -> int | None:
+    """Return integer seconds for an MP4-family container (m4a, mp4, mov).
+
+    Walks the top-level box list looking for ``moov``, then defers to
+    ``_mp4_find_mvhd_seconds`` for the actual ``mvhd`` lookup. Returns
+    ``None`` if no ``moov`` is reachable from the top — which is the
+    case for fragmented MP4 (rare for voice memos) where the
+    metadata lives in ``moof`` boxes we don't try to parse.
+    """
+    pos = 0
+    end = len(data)
+    while pos + 8 <= end:
+        size = struct.unpack(">I", data[pos : pos + 4])[0]
+        type_ = data[pos + 4 : pos + 8]
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                return None
+            size = struct.unpack(">Q", data[pos + 8 : pos + 16])[0]
+            header = 16
+        if size < header or pos + size > end:
+            return None
+        if type_ == b"moov":
+            secs = _mp4_find_mvhd_seconds(data[pos + header : pos + size])
+            if secs is not None:
+                return secs
+        pos += size
+    return None
+
+
+# WAV mimes vary by sniffer (audio/wav, audio/x-wav, audio/wave); MP4-
+# family audio mimes vary too (audio/mp4, audio/x-m4a, audio/aac,
+# audio/m4a). Cover the common spellings; fall back to magic-byte
+# sniffing for the rest.
+_WAV_MIMES = {"audio/wav", "audio/wave", "audio/x-wav"}
+_MP4_AUDIO_MIMES = {"audio/mp4", "audio/x-m4a", "audio/m4a", "audio/aac"}
+
+
+def _audio_duration_seconds(data: bytes, mime: str) -> int | None:
+    """Best-effort duration in seconds from common audio container headers.
+
+    Supports WAV (trivial RIFF) and MP4-family containers (m4a, mp4,
+    mov) — the two formats voice memos and meeting recordings
+    overwhelmingly use. MP3, OGG, FLAC, Opus all return ``None`` and
+    fall through to the size-based estimate; happy to add them when a
+    user actually hits the gap.
+    """
+    if not data:
+        return None
+    if mime in _WAV_MIMES:
+        return _wav_duration_seconds(data)
+    if mime in _MP4_AUDIO_MIMES:
+        return _mp4_duration_seconds(data)
+    # Sniff the magic bytes for the case where mime detection landed
+    # on a generic audio/* but the bytes are clearly one of our
+    # supported formats.
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WAVE":
+        return _wav_duration_seconds(data)
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return _mp4_duration_seconds(data)
+    return None
+
+
+def _audio_size_based_seconds_range(byte_size: int) -> tuple[int, int]:
+    """Convert a bytes count into a ``(low, high)`` seconds range.
+
+    Brackets the realistic bitrate band for ``audio/*``: a high
+    bitrate yields fewer seconds (lower bound), a low bitrate yields
+    more seconds (upper bound). Floors both at 1 so a tiny snippet
+    still costs at least one rate-unit per provider.
+    """
+    bits = max(0, byte_size) * 8
+    secs_low = max(1, bits // _AUDIO_BITRATE_HIGH_BPS)
+    secs_high = max(secs_low, bits // _AUDIO_BITRATE_LOW_BPS)
+    return (secs_low, secs_high)
 
 
 _TEXTY_MIMES = {"application/json", "application/xml", "application/x-yaml"}
@@ -497,6 +677,25 @@ def _count_attachment_range(
         low, high = _pdf_tokens_per_page_range(provider)
         pages = _pdf_page_count(data) if data is not None else 1
         return (pages * low, pages * high)
+    if mime.startswith("audio/"):
+        # Bias to "warn loudly" rather than "show a confident wrong
+        # number" — audio routinely runs to tens of thousands of
+        # tokens (Gemini bills 32 tok/sec, so a 48-min meeting is
+        # ~92k), and the prior _UNKNOWN_BINARY_TOKENS=300 fallback
+        # was off by two orders of magnitude on real-world voice
+        # memos. Header parsing collapses the range to an exact value
+        # for WAV / MP4-family containers; everything else widens to
+        # the bitrate-band envelope so the user sees the uncertainty
+        # at the prompt instead of in the bill.
+        rate = _AUDIO_TOKENS_PER_SECOND.get(provider, 32)
+        if data is None:
+            return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
+        secs = _audio_duration_seconds(data, mime)
+        if secs is not None:
+            tokens = secs * rate
+            return (tokens, tokens)
+        secs_low, secs_high = _audio_size_based_seconds_range(len(data))
+        return (secs_low * rate, secs_high * rate)
     if data is None:
         return (_UNKNOWN_BINARY_TOKENS, _UNKNOWN_BINARY_TOKENS)
     texty_by_mime = mime.startswith("text/") or mime in _TEXTY_MIMES

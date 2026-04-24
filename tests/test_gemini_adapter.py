@@ -186,6 +186,44 @@ def test_adapter_encodes_pdf_as_inline_data(fake_genai):
     assert base64.b64decode(inline["inline_data"]["data"]) == pdf_bytes
 
 
+def test_adapter_encodes_audio_as_inline_data(fake_genai):
+    """Audio attachments must be passed through to count_tokens as
+    inline_data — dropping them (the previous behaviour) silently
+    under-counted Gemini prompts by ~10× on real-world voice memos.
+    """
+    audio_bytes = b"\x00\x00\x00\x20ftypM4A " + b"\xaa" * 200
+    adapter = GeminiAdapter()
+    adapter.count(
+        _FakePrompt(
+            "transcribe",
+            attachments=[_FakeAttachment(content=audio_bytes, type="audio/mp4")],
+        ),
+        _FakeGemini(),
+    )
+    parts = fake_genai[0]["contents"][0]["parts"]
+    inline = next(p for p in parts if "inline_data" in p)
+    assert inline["inline_data"]["mime_type"] == "audio/mp4"
+    assert base64.b64decode(inline["inline_data"]["data"]) == audio_bytes
+
+
+def test_adapter_encodes_video_as_inline_data(fake_genai):
+    """Same widening as audio — video bills heavily and must reach the
+    count_tokens endpoint rather than being silently dropped.
+    """
+    video_bytes = b"\x00\x00\x00\x20ftypisom" + b"\xbb" * 200
+    adapter = GeminiAdapter()
+    adapter.count(
+        _FakePrompt(
+            "summarise",
+            attachments=[_FakeAttachment(content=video_bytes, type="video/mp4")],
+        ),
+        _FakeGemini(),
+    )
+    parts = fake_genai[0]["contents"][0]["parts"]
+    inline = next(p for p in parts if "inline_data" in p)
+    assert inline["inline_data"]["mime_type"] == "video/mp4"
+
+
 def test_adapter_drops_url_only_attachments(fake_genai):
     """URL attachments without content are silently dropped — no HEAD or
     GET is performed just to compute a token estimate."""

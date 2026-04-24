@@ -273,7 +273,18 @@ def _gemini_part_from_attachment(a: Any) -> dict | None:
             content = None
     if content is None:
         return None
-    if mime and (mime.startswith("image/") or mime == "application/pdf"):
+    # Gemini's count_tokens accepts inline_data for any media type the
+    # model itself accepts — audio (32 tok/sec) and video (~263 tok/sec
+    # by default) both bill heavily, so dropping them via the prior
+    # image/PDF-only filter silently under-counted the prompt by orders
+    # of magnitude. Pass any media-shaped mime through and let the API
+    # tell us the real number.
+    if mime and (
+        mime.startswith("image/")
+        or mime.startswith("audio/")
+        or mime.startswith("video/")
+        or mime == "application/pdf"
+    ):
         return {
             "inline_data": {
                 "mime_type": mime,

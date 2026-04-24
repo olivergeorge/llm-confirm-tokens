@@ -121,6 +121,7 @@ network calls:
 | Text attachments (`text/*`, JSON, YAML, XML) | read from disk + tokenised |
 | Image attachments | provider-aware formula from parsed width/height — see below |
 | PDF attachments | `pages × per-page-rate`; page count from `/Type /Page` markers (bytes fallback only for compressed PDFs) and per-page rate picked by provider — see below |
+| Audio attachments | `seconds × tokens-per-second` (Gemini = 32); duration from WAV / MP4 (m4a) headers when parseable, otherwise a wide bitrate-band envelope from file size — see below |
 | Tool definitions | JSON-serialised and tokenised |
 | Prior tool results | `str(output)` tokenised |
 | Structured-output schema | JSON-serialised and tokenised |
@@ -187,6 +188,40 @@ compressed into an object stream and the regex returns 0.
 The drift warning (`LLM_CONFIRM_TOKENS_DRIFT_WARN`) is designed to
 catch workloads that leave the range entirely — e.g. very image-heavy
 PDFs where Gemini's embedded-image billing exceeds even the high bound.
+
+### Audio rate by provider
+
+Audio is the largest under-count risk in the heuristic, because real
+files are routinely tens of thousands of tokens — a 48-minute voice
+memo on Gemini bills ~92k. We multiply duration in seconds by a
+per-provider rate:
+
+| Model class | Tokens per second | Source |
+| ----------- | ----------------- | ------ |
+| Gemini (default) | 32 | [Gemini token counting: "each second of audio = 32 tokens"](https://ai.google.dev/gemini-api/docs/tokens) |
+| Anthropic `claude-*` | 32 | Anthropic's API doesn't accept audio inputs; the rate is Gemini's so the gate still surfaces the scale before the request is rejected. |
+| OpenAI `gpt-*` audio models | 32 | OpenAI's audio model billing is model-specific and not published as a single per-second rate; Gemini's number is a directional default until someone has a concrete substitute. |
+
+Duration comes from header parsing where it's cheap and standard:
+
+- **WAV** (`audio/wav`, `audio/wave`, `audio/x-wav`): exact, from the
+  RIFF `fmt ` byte rate and `data` chunk size.
+- **MP4-family** (`audio/mp4`, `audio/m4a`, `audio/x-m4a`,
+  `audio/aac`): exact, from the `moov > mvhd` atom timescale and
+  duration. Covers iOS Voice Memos and most meeting-recording apps.
+- Magic-byte sniffing recognises both formats even when the mime
+  detection lands on a generic `audio/*`.
+
+Everything else (MP3, OGG, Opus, FLAC) falls back to a **wide
+size-based range** that brackets realistic bitrates — 256 kbps at the
+low end of seconds (dense music files) up to 16 kbps at the high end
+(low-bitrate voice). For a 1 MB file that's roughly 1k–17k tokens on
+Gemini. The range width is the honest signal: it tells you the
+estimate isn't tight, instead of the prior flat 300-token bucket that
+hid the uncertainty.
+
+URL-only audio (no bytes available) still falls back to the flat
+unknown-binary bucket — we don't fetch audio just to size it.
 
 ### These are a best guess, not billing-grade
 
@@ -398,8 +433,12 @@ count is typically within ~5% of the real bill, always erring high.
   even when the same model accepts it on `generate_content`.
   Inlining keeps the adapter model-agnostic at the cost of ~5% of
   envelope tokens that don't actually hit the bill.
-- **Attachments**: images and PDFs go in as `inline_data` parts with
-  base64-encoded content. URL-only attachments are dropped (no HEAD
+- **Attachments**: images, PDFs, **audio** (`audio/*`), and **video**
+  (`video/*`) go in as `inline_data` parts with base64-encoded content.
+  Audio in particular is critical to pass through — Gemini bills audio
+  at ~32 tokens/sec, so dropping it would silently under-count by an
+  order of magnitude on real voice memos. URL-only attachments are
+  dropped (no HEAD
   or GET just to count).
 - **Tools and tool results**: not included. Gemini's tool format
   requires a multi-turn message history whose invariants count_tokens
@@ -432,10 +471,16 @@ count is typically within ~5% of the real bill, always erring high.
   gating tool should not cause new outbound HTTP traffic to third
   parties the user hasn't already consented to — the single
   `count_tokens` request to their own provider is the one exception.
-- **Binary attachments we don't know how to handle** (audio, video,
-  bespoke file types) are dropped by the adapters. The heuristic
-  still counts them against its flat `_UNKNOWN_BINARY_TOKENS` budget,
-  so the estimate doesn't silently skip to zero.
+- **Audio and video pass through to Gemini's adapter** as
+  `inline_data`; the Anthropic and OpenAI adapters drop them (Anthropic
+  doesn't accept them at all, OpenAI's audio support is model-specific
+  enough that the count endpoint round-trip isn't reliable yet). The
+  heuristic side handles audio for all providers via the rate table
+  above so the gate still warns about scale.
+- **Other binary attachments we don't know how to handle** (bespoke
+  file types) are dropped by the adapters. The heuristic still counts
+  them against its flat `_UNKNOWN_BINARY_TOKENS` budget, so the
+  estimate doesn't silently skip to zero.
 - **Adapter errors always fall back to the heuristic**, with a one-
   line stderr notice naming the provider and the exception. Gating
   is the feature; exact mode is a refinement. A broken refinement
